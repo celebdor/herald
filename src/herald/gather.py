@@ -1,16 +1,100 @@
 """Data gathering subprocess, issue JSON processing, draft persistence, and batch drafting."""
 
 import asyncio
+import hashlib
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pyadf
 
-from .config import _find_cached_gather, _save_cache_meta
+from .config import _find_cached_gather, _get_state_dir, _save_cache_meta
 from .llm import TokenUsage, draft_ryg
 from .validation import validate_draft
+
+
+def _manifest_gathered_at(manifest: dict) -> Optional[str]:
+    """Return the gather timestamp when the manifest records one."""
+    value = manifest.get("gathered_at")
+    return value if _parse_instant(value) else None
+
+
+def _parse_instant(value) -> Optional[datetime]:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        instant = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return instant if instant.tzinfo is not None else None
+
+
+def _github_repository(url: Optional[str]) -> Optional[str]:
+    """Extract owner/repo from a canonical GitHub pull request URL."""
+    if not isinstance(url, str):
+        return None
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return None
+    parts = parsed.path.strip("/").split("/")
+    if (
+        parsed.hostname == "github.com"
+        and len(parts) >= 4
+        and parts[2] == "pull"
+        and parts[0]
+        and parts[1]
+    ):
+        return f"{parts[0]}/{parts[1]}"
+    return None
+
+
+def _temporal_context(manifest: Optional[dict], issue_key: Optional[str] = None) -> dict:
+    """Build an explicit temporal envelope, marking legacy metadata unknown."""
+    manifest = manifest or {}
+    window = manifest.get("reporting_window")
+    if not isinstance(window, dict):
+        window = {}
+    start = window.get("start")
+    end = window.get("end_exclusive")
+    timezone_name = window.get("timezone")
+    start_instant = _parse_instant(start)
+    end_instant = _parse_instant(end)
+    try:
+        ZoneInfo(timezone_name)
+        valid_timezone = True
+    except (ZoneInfoNotFoundError, TypeError, ValueError):
+        valid_timezone = False
+    known = bool(
+        start_instant and end_instant and start_instant < end_instant and valid_timezone
+    )
+    gathered_at = None
+    issue_timestamps = manifest.get("issue_gathered_at")
+    if isinstance(issue_timestamps, dict) and issue_key:
+        gathered_at = issue_timestamps.get(issue_key)
+    if not gathered_at and not isinstance(issue_timestamps, dict):
+        gathered_at = _manifest_gathered_at(manifest)
+    gathered_at = gathered_at if _parse_instant(gathered_at) else None
+    return {
+        "reporting_window": {
+            "start": start if known else None,
+            "end_exclusive": end if known else None,
+            "timezone": timezone_name if known else None,
+            "status": "known" if known else "unknown",
+        },
+        "gathered_at": gathered_at,
+        "gather_freshness": "known" if gathered_at else "unknown",
+    }
+
+
+def _persist_manifest(date_dir: Path, manifest: dict) -> None:
+    path = date_dir / "manifest.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(manifest, indent=2))
 
 
 async def run_gather(
@@ -84,6 +168,16 @@ async def run_gather(
     end_date = new_manifest["config"]["date_range"]["end"]
     date_dir = Path(output_dir) / end_date
 
+    # Stamp the completed gather so later cached sessions can distinguish a
+    # known capture time from legacy manifests that predate this field.
+    new_manifest["gathered_at"] = datetime.now(timezone.utc).isoformat()
+    gathered_keys = set(issue_keys) if issue_keys else None
+    new_manifest["issue_gathered_at"] = {
+        issue["key"]: new_manifest["gathered_at"]
+        for issue in new_manifest.get("issues", [])
+        if issue.get("key") and (gathered_keys is None or issue["key"] in gathered_keys)
+    }
+
     if issue_keys:
         manifest_path = date_dir / "manifest.json"
         if manifest_path.exists():
@@ -93,11 +187,22 @@ async def run_gather(
             merged = [refreshed.pop(i["key"], i) for i in existing["issues"]]
             merged.extend(refreshed.values())
             existing["issues"] = merged
-            with open(manifest_path, "w") as f:
-                json.dump(existing, f)
+            existing["gathered_at"] = new_manifest["gathered_at"]
+            issue_timestamps = existing.get("issue_gathered_at", {})
+            if not isinstance(issue_timestamps, dict):
+                issue_timestamps = {}
+            issue_timestamps.update(new_manifest["issue_gathered_at"])
+            existing["issue_gathered_at"] = issue_timestamps
+            # Preserve a resolved window only when the gatherer supplies one.
+            existing.pop("reporting_window", None)
+            if isinstance(new_manifest.get("reporting_window"), dict):
+                existing["reporting_window"] = new_manifest["reporting_window"]
+            _persist_manifest(date_dir, existing)
             return date_dir, existing
+        _persist_manifest(date_dir, new_manifest)
         return date_dir, new_manifest
 
+    _persist_manifest(date_dir, new_manifest)
     _save_cache_meta(args, date_dir)
     return date_dir, new_manifest
 
@@ -118,7 +223,7 @@ def _field_to_text(value) -> str:
 
 def is_significant(data: dict) -> bool:
     """Return True if the issue had meaningful activity in the reporting range."""
-    if bool(data.get("prs")):
+    if data.get("events_in_window"):
         return True
     for cl in data.get("changelog_in_range", []):
         if any(i.get("field") == "status" for i in cl.get("items", [])):
@@ -136,62 +241,110 @@ def is_significant(data: dict) -> bool:
     return False
 
 
-def _prune_issue(data: dict) -> dict:
+def _prune_issue(data: dict, manifest: Optional[dict] = None) -> dict:
     """Return a compact subset of the per-issue JSON suitable for LLM input."""
     issue = data.get("issue", data)
     assignee = issue.get("assignee")
+    temporal = _temporal_context(manifest, issue.get("key"))
     pruned = {
         "key": issue.get("key"),
         "summary": issue.get("summary"),
         "status": issue.get("status"),
         "assignee": assignee.get("name", "?") if isinstance(assignee, dict) else (assignee or "?"),
+        **temporal,
+    }
+
+    # The gatherer owns event discovery and classification. Do not infer event
+    # dates from current PR state or from counts such as reviews_in_range.
+    events = data.get("events_in_window")
+    pruned["events_in_window"] = []
+    undated = data.get("undated_activity")
+    pruned["undated_activity"] = list(undated) if isinstance(undated, list) else []
+    carry_forward = data.get("carry_forward_context")
+    if not isinstance(carry_forward, dict):
+        carry_forward = {}
+    pruned["carry_forward_context"] = {
+        **carry_forward,
         "current_status_summary": _field_to_text(issue.get("current_status_summary") or ""),
         "last_status_update": issue.get("last_status_summary_update", ""),
+        "status": issue.get("status"),
     }
+    older_activity = carry_forward.get("older_activity")
+    pruned["carry_forward_context"]["older_activity"] = (
+        list(older_activity) if isinstance(older_activity, list) else []
+    )
+
+    temporal_known = temporal["reporting_window"]["status"] == "known"
+    window_start = _parse_instant(temporal["reporting_window"]["start"])
+    window_end = _parse_instant(temporal["reporting_window"]["end_exclusive"])
+
+    def classify_event(event: dict) -> None:
+        event = dict(event)
+        occurred_at = _parse_instant(event.get("occurred_at"))
+        if not occurred_at:
+            event["date_confidence"] = "unknown"
+            pruned["undated_activity"].append(event)
+        elif temporal_known and window_start <= occurred_at < window_end:
+            pruned["events_in_window"].append(event)
+        else:
+            # A timestamp outside the range is useful history, but cannot
+            # support a new accomplishment for this report.
+            pruned["carry_forward_context"]["older_activity"].append(event)
+
+    if isinstance(events, list):
+        for event in events:
+            if isinstance(event, dict):
+                classify_event(event)
+            else:
+                pruned["undated_activity"].append({
+                    "value": event,
+                    "date_confidence": "unknown",
+                })
 
     desc = data.get("descendants", {})
     if isinstance(desc, dict):
-        pruned["descendants"] = {
+        pruned["carry_forward_context"]["descendants"] = {
             "total": desc.get("total", 0),
             "completion_pct": round(desc.get("completion_pct", 0.0)),
             "by_status": desc.get("by_status", {}),
-            "updated_in_range": desc.get("updated_in_range", []),
         }
 
-    pruned["changelog"] = [
-        {
-            "date": i.get("date"),
-            "author": i.get("author"),
-            "changes": [
-                {"field": c.get("field"), "from": c.get("from"), "to": c.get("to")}
-                for c in i.get("items", [])
-            ],
-        }
-        for i in data.get("changelog_in_range", [])
-    ]
-
-    pruned["comments"] = [
-        {
-            "author_name": c.get("author_name"),
-            "body": c.get("body"),
-        }
-        for c in data.get("comments_in_range", [])
-        if not c.get("is_bot")
-    ]
-
-    pruned["prs"] = [
+    pruned["carry_forward_context"]["pull_requests"] = [
         {
             "number": pr.get("number"),
+            "repository": pr.get("repository") or _github_repository(pr.get("url")),
+            "url": pr.get("url"),
             "title": pr.get("title"),
             "state": pr.get("state"),
             "is_draft": pr.get("is_draft", False),
             "merged_at": pr.get("merged_at"),
             "dates": pr.get("dates", {}),
-            "commits_in_range": pr.get("activity_summary", {}).get("commits_in_range", 0),
-            "reviews_in_range": pr.get("activity_summary", {}).get("reviews_in_range", 0),
         }
         for pr in data.get("prs", [])
     ]
+
+    # Legacy source-specific in-range buckets can be retained as dated events
+    # only when they carry the event's own timestamp. Missing dates remain an
+    # explicit coverage gap. PR state and aggregate commit/review counts are
+    # deliberately not converted into events.
+    if "events_in_window" not in data:
+        for comment in data.get("comments_in_range", []):
+            if not comment.get("is_bot"):
+                event = {
+                    "type": "jira_comment",
+                    "occurred_at": comment.get("created_at") or comment.get("created") or comment.get("date"),
+                    "author": comment.get("author_name"),
+                    "text": comment.get("body"),
+                }
+                classify_event(event)
+        for change in data.get("changelog_in_range", []):
+            event = {
+                "type": "jira_transition",
+                "occurred_at": change.get("created_at") or change.get("date"),
+                "author": change.get("author"),
+                "changes": change.get("items", []),
+            }
+            classify_event(event)
 
     return pruned
 
@@ -212,13 +365,59 @@ def load_current_statuses(date_dir: Path, issue_keys: list) -> dict:
 
 # ─── Draft Persistence ───────────────────────────────────────────────────────
 
+def _draft_state_dir(date_dir: Path) -> Path:
+    """Return state storage scoped to the gathered output directory and date."""
+    output_id = hashlib.sha256(
+        str(date_dir.parent.resolve()).encode("utf-8")
+    ).hexdigest()[:16]
+    return _get_state_dir() / "drafts" / output_id / date_dir.name
+
+
 def _drafts_path(date_dir: Path) -> Path:
-    return date_dir / "drafts.json"
+    return _draft_state_dir(date_dir) / "drafts.json"
+
+
+def _draft_inputs_path(date_dir: Path) -> Path:
+    return _draft_state_dir(date_dir) / "draft_inputs.json"
+
+
+def _legacy_draft_path(date_dir: Path, filename: str) -> Path:
+    """Path used before draft state moved out of the gathered data directory."""
+    return date_dir / filename
+
+
+def _input_fingerprint(summary: str) -> str:
+    return hashlib.sha256(summary.encode("utf-8")).hexdigest()
+
+
+def _load_draft_inputs(date_dir: Path) -> dict:
+    path = _draft_inputs_path(date_dir)
+    if not path.exists():
+        path = _legacy_draft_path(date_dir, "draft_inputs.json")
+    if not path.exists():
+        return {}
+    try:
+        with path.open() as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_draft_input(date_dir: Path, key: str, summary: str) -> None:
+    """Record which exact gathered input produced a draft."""
+    inputs = _load_draft_inputs(date_dir)
+    inputs[key] = _input_fingerprint(summary)
+    path = _draft_inputs_path(date_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as f:
+        json.dump(inputs, f, indent=2)
 
 
 def load_saved_drafts(date_dir: Path) -> dict:
     """Load previously saved drafts from disk, or empty dict."""
     path = _drafts_path(date_dir)
+    if not path.exists():
+        path = _legacy_draft_path(date_dir, "drafts.json")
     if not path.exists():
         return {}
     try:
@@ -247,12 +446,15 @@ async def batch_draft(
     usage: TokenUsage,
     callback=None,
     only_significant: bool = False,
+    manifest: Optional[dict] = None,
+    force_redraft: bool = False,
 ) -> tuple:
     """Return drafts, summaries, failed keys, and per-key outcomes.
 
     Outcomes are drafted, quiet_skip, missing_data, draft_failed, or invalid_draft.
     """
-    saved = load_saved_drafts(date_dir)
+    saved = {} if force_redraft else load_saved_drafts(date_dir)
+    saved_inputs = _load_draft_inputs(date_dir)
     sem = asyncio.Semaphore(10)
     max_retries = 3
 
@@ -273,21 +475,21 @@ async def batch_draft(
                     await callback(idx + 1, len(issues), f"Skipped {key} (not significant)")
                 return key, None, None, "quiet_skip"
 
-            if key in saved:
-                _, cache_error = validate_draft(saved[key])
-                if not cache_error:
-                    if callback:
-                        await callback(idx + 1, len(issues), f"Loaded {key} (cached draft)")
-                    return key, saved[key], "(cached)", "drafted"
-
             try:
-                summary = json.dumps(_prune_issue(data), indent=2)
+                summary = json.dumps(_prune_issue(data, manifest), indent=2)
             except Exception as e:
                 msg = f"Failed {key} (prune): {e}"
                 print(f"Warning: {msg}", file=sys.stderr)
                 if callback:
                     await callback(idx + 1, len(issues), msg)
                 return key, None, None, "draft_failed"
+
+            if key in saved and saved_inputs.get(key) == _input_fingerprint(summary):
+                _, cache_error = validate_draft(saved[key])
+                if not cache_error:
+                    if callback:
+                        await callback(idx + 1, len(issues), f"Loaded {key} (cached draft)")
+                    return key, saved[key], summary, "drafted"
 
             last_err = None
             for attempt in range(max_retries):
@@ -330,8 +532,15 @@ async def batch_draft(
             drafts[key] = draft
         elif outcome in ("missing_data", "draft_failed", "invalid_draft"):
             failed.append(key)
-        if summary and summary != "(cached)":
+        if summary:
             result_summaries[key] = summary
 
     save_drafts(date_dir, drafts)
+    draft_inputs = {
+        key: _input_fingerprint(result_summaries[key])
+        for key in drafts
+        if key in result_summaries
+    }
+    with _draft_inputs_path(date_dir).open("w") as f:
+        json.dump(draft_inputs, f, indent=2)
     return drafts, result_summaries, failed, outcomes

@@ -552,10 +552,13 @@ def test_prune_issue_includes_key_fields():
     assert pruned["summary"] == "Test issue"
     assert pruned["status"] == "In Progress"
     assert pruned["assignee"] == "Alice"
-    assert "descendants" in pruned
-    assert "changelog" in pruned
-    assert "comments" in pruned
-    assert "prs" in pruned
+    assert pruned["reporting_window"]["status"] == "unknown"
+    assert pruned["gather_freshness"] == "unknown"
+    assert "descendants" in pruned["carry_forward_context"]
+    assert "current_status_summary" in pruned["carry_forward_context"]
+    assert pruned["events_in_window"] == []
+    assert pruned["undated_activity"] == []
+    assert "pull_requests" in pruned["carry_forward_context"]
 
 
 def test_prune_issue_converts_adf_current_status():
@@ -565,8 +568,9 @@ def test_prune_issue_converts_adf_current_status():
     data = _make_issue_data()
     data["issue"]["current_status_summary"] = adf
     pruned = _prune_issue(data)
-    assert "Green - on track" in pruned["current_status_summary"]
-    assert isinstance(pruned["current_status_summary"], str)
+    current_summary = pruned["carry_forward_context"]["current_status_summary"]
+    assert "Green - on track" in current_summary
+    assert isinstance(current_summary, str)
 
 
 def test_prune_issue_strips_bot_comments():
@@ -576,8 +580,8 @@ def test_prune_issue_strips_bot_comments():
         {"date": "2026-08-01T00:00:00", "author_name": "human", "body": "real comment", "is_bot": False},
     ]
     pruned = _prune_issue(data)
-    assert len(pruned["comments"]) == 1
-    assert pruned["comments"][0]["author_name"] == "human"
+    assert len(pruned["undated_activity"]) == 1
+    assert pruned["undated_activity"][0]["author"] == "human"
 
 
 def test_prune_issue_pr_drops_raw_arrays():
@@ -594,12 +598,67 @@ def test_prune_issue_pr_drops_raw_arrays():
         "reviews_in_range": [{"author_name": "Bob"}],
     }]
     pruned = _prune_issue(data)
-    pr = pruned["prs"][0]
+    pr = pruned["carry_forward_context"]["pull_requests"][0]
     assert pr["number"] == 42
-    assert pr["commits_in_range"] == 3
-    assert pr["reviews_in_range"] == 1
-    assert isinstance(pr["commits_in_range"], int)
+    assert pr["state"] == "MERGED"
+    assert "commits_in_range" not in pr
+    assert "reviews_in_range" not in pr
+    assert pruned["events_in_window"] == []
     assert "sha" not in str(pruned)
+
+
+def test_prune_issue_classifies_events_using_half_open_window():
+    data = _make_issue_data(events_in_window=[
+        {"type": "pr_review", "occurred_at": "2026-08-01T00:00:00Z", "text": "reviewed"},
+        {"type": "pr_commit", "occurred_at": "2026-08-08T00:00:00Z", "text": "boundary"},
+        {"type": "jira_comment", "text": "missing timestamp"},
+    ])
+    manifest = {
+        "reporting_window": {
+            "start": "2026-08-01T00:00:00Z",
+            "end_exclusive": "2026-08-08T00:00:00Z",
+            "timezone": "Europe/Prague",
+        },
+        "issue_gathered_at": {"ISSUE-1": "2026-08-08T00:05:00Z"},
+    }
+
+    pruned = _prune_issue(data, manifest)
+
+    assert pruned["reporting_window"]["status"] == "known"
+    assert pruned["gathered_at"] == "2026-08-08T00:05:00Z"
+    assert [event["type"] for event in pruned["events_in_window"]] == ["pr_review"]
+    assert pruned["carry_forward_context"]["older_activity"][0]["type"] == "pr_commit"
+    assert pruned["undated_activity"][0]["type"] == "jira_comment"
+
+
+def test_prune_issue_keeps_recent_review_separate_from_old_merge():
+    data = _make_issue_data(
+        events_in_window=[{
+            "type": "pr_review",
+            "occurred_at": "2026-08-04T12:00:00Z",
+            "pull_request": 42,
+        }],
+    )
+    data["prs"] = [{
+        "number": 42,
+        "title": "Fix bug",
+        "state": "MERGED",
+        "merged_at": "2026-07-15T12:00:00Z",
+    }]
+    manifest = {
+        "reporting_window": {
+            "start": "2026-08-01T00:00:00Z",
+            "end_exclusive": "2026-08-08T00:00:00Z",
+            "timezone": "Europe/Prague",
+        },
+        "issue_gathered_at": {"ISSUE-1": "2026-08-08T00:05:00Z"},
+    }
+
+    pruned = _prune_issue(data, manifest)
+
+    assert pruned["events_in_window"][0]["type"] == "pr_review"
+    assert pruned["carry_forward_context"]["pull_requests"][0]["merged_at"] == "2026-07-15T12:00:00Z"
+    assert len(pruned["events_in_window"]) == 1
 
 
 def test_is_significant_active_pr():

@@ -112,12 +112,22 @@ herald --project OCPSTRAT --profile my-team
 # Force re-gather (ignore cache)
 herald --project OCPSTRAT --refresh
 
+# Regenerate drafts while reusing gathered data
+herald --project OCPSTRAT --redraft
+
 # Skip issues with no recent activity
 herald --project OCPSTRAT --skip-quiet
 
 # Custom date range
 herald --project OCPSTRAT --start-date 2026-08-01 --end-date 2026-08-15
 ```
+
+Gathered Jira/GitHub evidence defaults to `.work/weekly-status` and can be
+changed with `--output-dir`. Drafts and their input fingerprints are stored
+separately under the platform state directory (`$XDG_STATE_HOME/herald`
+or `~/.local/state/herald` on Linux). `--redraft` skips saved drafts while
+allowing Herald to reuse the gathered-data cache; combine it with `--refresh`
+only when both evidence and drafts should be regenerated.
 
 ## TUI keybindings
 
@@ -142,6 +152,11 @@ When `coding_agent` is configured in prefs, `i` suspends the TUI and opens the a
 ```bash
 uv run pytest tests/ -v
 ```
+
+## Design specifications
+
+See [specs/](specs/README.md) for the exact initial drafting API inputs and
+the data flows for gathering, caching, review, revision, and Jira publication.
 
 ## Project structure
 

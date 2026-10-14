@@ -12,6 +12,37 @@ import anthropic
 from .config import UserPrefs, find_skills_dir
 
 
+_TEMPORAL_EVIDENCE_RULES = (
+    "Temporal evidence rules:\n"
+    "- Treat only events in `events_in_window` with an event-specific `occurred_at` "
+    "as evidence that an accomplishment happened during this reporting window.\n"
+    "- `carry_forward_context` describes current or historical state. It may support "
+    "a continuing risk or blocker, but does not establish when an accomplishment occurred.\n"
+    "- A pull request's current state or `merged_at` in carry-forward context does not "
+    "make its merge a new accomplishment this week. A dated in-window review or commit "
+    "may be reported as that specific activity.\n"
+    "- A recent comment is evidence that the comment was made, not that older work "
+    "described in it happened during this window.\n"
+    "- Treat `undated_activity` and unknown reporting-window or gather-freshness metadata "
+    "as uncertainty. Do not turn it into a new accomplishment or infer a date.\n"
+    "- It is valid to report no new milestone this week. Describe recurring blockers and "
+    "risks as continuing conditions.\n"
+)
+
+_RYG_MARKDOWN_FORMAT_RULES = (
+    "Produce only the `ryg_field_markdown` output format for Jira Cloud REST API v3. "
+    "No preamble or explanation; output starts with `* Color Status:`. "
+    "Use standard Markdown bullets: top-level bullets are `* ` and nested bullets "
+    "are `  * ` (two spaces, asterisk, space). Never use Jira wiki-style `**` "
+    "sub-bullets. Render every PR reference as a Markdown link labeled "
+    "`owner/repo#number` and linked to the PR URL in the evidence, using the "
+    "provided `repository` and `url` fields. Never output a bare `#number` or "
+    "shorthand `repo#number`, or put a raw PR URL in parentheses. The URL must "
+    "appear only as the Markdown link target. Do not guess a repository or URL "
+    "when the evidence does not provide one."
+)
+
+
 LITELLM_PRICING_URL = (
     "https://raw.githubusercontent.com/BerriAI/litellm/main/"
     "model_prices_and_context_window.json"
@@ -121,7 +152,12 @@ async def request_changes_api(
     response = await client.messages.create(
         model=model,
         max_tokens=2048,
-        system="You are revising a Jira R/Y/G status update. Output ONLY the revised status update in the exact same format.",
+        system=(
+            "You are revising a Jira R/Y/G status update. Output ONLY the revised "
+            "status update in the exact same format.\n\n"
+            + _TEMPORAL_EVIDENCE_RULES
+            + _RYG_MARKDOWN_FORMAT_RULES
+        ),
         messages=[{
             "role": "user",
             "content": (
@@ -147,6 +183,7 @@ def build_system_prompt(prefs: UserPrefs) -> str:
     parts = [
         "You are a Jira status analyst producing weekly R/Y/G status updates.",
         "Apply the analysis methodology and output format defined below.\n",
+        _TEMPORAL_EVIDENCE_RULES,
     ]
     for filename in ("activity-analysis.md", "formatting.md"):
         path = skills_dir / filename
@@ -159,13 +196,5 @@ def build_system_prompt(prefs: UserPrefs) -> str:
         rules = "\n".join(f"- {rule}" for rule in prefs.writing_rules)
         parts.append(f"## Additional writing rules (user preferences)\n\n{rules}\n")
 
-    parts.append(
-        "Produce only the `ryg_field` format output defined in formatting.md. "
-        "No preamble, no explanation — output starts with `* Color Status:`.\n\n"
-        "CRITICAL FORMATTING RULE: Use standard markdown bullets only. "
-        "Top-level bullets are `* ` and nested bullets are `  * ` (two spaces "
-        "+ asterisk + space). NEVER use wiki-style `**` for sub-bullets — the "
-        "output is parsed as markdown and `**` will be misinterpreted as bold "
-        "markers, corrupting the Jira field."
-    )
+    parts.append(_RYG_MARKDOWN_FORMAT_RULES)
     return "\n".join(parts)

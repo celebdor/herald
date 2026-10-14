@@ -45,6 +45,10 @@ Environment variables:
     parser.add_argument("--profile", help="Named profile from prefs.toml")
     parser.add_argument("--prefs", type=Path, help="Path to prefs.toml")
     parser.add_argument("--refresh", action="store_true", help="Force re-gather even if cached data exists")
+    parser.add_argument(
+        "--redraft", action="store_true",
+        help="Regenerate drafts while reusing gathered data when available",
+    )
     return parser
 
 

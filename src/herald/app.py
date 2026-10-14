@@ -26,6 +26,7 @@ from .gather import (
     load_current_statuses,
     run_gather,
     save_drafts,
+    save_draft_input,
 )
 from .jira import get_jira_auth, update_jira_status
 from .llm import (
@@ -504,12 +505,13 @@ class ReviewScreen(Screen):
         table = self.query_one("#issue-table", DataTable)
         table.update_cell(key, self._col_keys[3], "Refreshing…")
         try:
-            _, manifest = await run_gather(
+            date_dir, manifest = await run_gather(
                 self.scripts_dir, self.args,
                 self.args.output_dir if hasattr(self.args, "output_dir") else ".work/weekly-status",
                 refresh=True, issue_keys=[key],
             )
 
+            self.date_dir = date_dir
             issue_file = self.date_dir / "issues" / f"{key}.json"
             if not issue_file.exists():
                 self.outcomes[key] = "missing_data"
@@ -518,7 +520,7 @@ class ReviewScreen(Screen):
                 return
 
             issue_data = json.loads(issue_file.read_text())
-            pruned = _prune_issue(issue_data)
+            pruned = _prune_issue(issue_data, manifest)
             summary = json.dumps(pruned, indent=2)
             self.summaries[key] = summary
 
@@ -530,6 +532,7 @@ class ReviewScreen(Screen):
             _, validation_error = validate_draft(draft)
             self.outcomes[key] = "invalid_draft" if validation_error else "drafted"
             self._save_drafts()
+            save_draft_input(self.date_dir, key, summary)
             table.update_cell(key, self._col_keys[2], extract_color(draft))
             table.update_cell(key, self._col_keys[3], "Invalid draft" if validation_error else "-")
             self.results.pop(key, None)
@@ -574,7 +577,8 @@ class ReviewScreen(Screen):
 
             drafts, summaries, failed, outcomes = await batch_draft(
                 self.client, self.model, self.system_prompt, date_dir,
-                manifest["issues"], self.usage,
+                manifest["issues"], self.usage, manifest=manifest,
+                force_redraft=True,
             )
             for key in outcomes:
                 self.drafts.pop(key, None)
@@ -815,6 +819,8 @@ class StatusUpdateApp(App):
                 manifest["issues"], usage,
                 callback=self._make_callback(),
                 only_significant=only_significant,
+                manifest=manifest,
+                force_redraft=getattr(args, "redraft", False),
             )
             quiet = sum(state == "quiet_skip" for state in outcomes.values())
             missing = sum(state == "missing_data" for state in outcomes.values())

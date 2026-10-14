@@ -124,6 +124,17 @@ def _get_data_dir() -> Path:
     return Path(base) / "herald"
 
 
+def _get_state_dir() -> Path:
+    """Return the per-user state directory for persistent Herald state."""
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA", os.environ.get("APPDATA", os.path.expanduser("~")))
+    elif sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    else:
+        base = os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state"))
+    return Path(base) / "herald"
+
+
 def _fetch_ai_helpers(data_dir: Path) -> Path:
     """Clone ai-helpers into data_dir and return the resolved skills dir."""
     import shutil
