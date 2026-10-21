@@ -30,11 +30,11 @@ Environment variables:
     parser.add_argument("--label", help="Filter by label")
     parser.add_argument("--assignee", action="append", help="Filter by assignee email (repeatable)")
     parser.add_argument("--exclude", action="append", help="Exclude assignee email (repeatable)")
-    parser.add_argument("--days", type=int, default=7, help="Lookback days (default: 7)")
+    parser.add_argument("--days", type=int, help="Lookback days (default: 7)")
     parser.add_argument("--start-date", dest="start_date", help="Start date YYYY-MM-DD")
     parser.add_argument("--end-date", dest="end_date", help="End date YYYY-MM-DD (default: today)")
     parser.add_argument(
-        "--output-dir", dest="output_dir", default=".work/weekly-status",
+        "--output-dir", dest="output_dir",
         help="Output directory for gathered data (default: .work/weekly-status)",
     )
     parser.add_argument(
@@ -52,6 +52,13 @@ Environment variables:
     return parser
 
 
+# Defaults applied after profile merge so a profile can override them.
+_ARG_DEFAULTS = {
+    "days": 7,
+    "output_dir": ".work/weekly-status",
+}
+
+
 async def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
@@ -62,6 +69,10 @@ async def main() -> None:
         for key, value in profile.items():
             if not getattr(args, key, None):
                 setattr(args, key, value)
+
+    for key, value in _ARG_DEFAULTS.items():
+        if getattr(args, key, None) is None:
+            setattr(args, key, value)
 
     scripts_dir = find_scripts_dir(prefs)
     app = StatusUpdateApp(args, prefs, scripts_dir)
