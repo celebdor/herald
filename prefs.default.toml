@@ -18,6 +18,9 @@ writing_rules = [
 
 [jira]
 url = "https://redhat.atlassian.net"
+# Jira Target Version field; defaults to Red Hat's field ID.
+# Falls back to fixVersions when empty. Set to "fixVersions" to use only that field.
+target_version_field = "customfield_10855"
 # skills_dir is optional. When unset the app resolves it in order:
 #   1. HERALD_SKILLS_DIR env var
 #   2. Previously auto-fetched copy in the platform data directory
@@ -25,6 +28,30 @@ url = "https://redhat.atlassian.net"
 #   4. Auto git-clone of openshift-eng/ai-helpers into the data directory
 # Uncomment and set if you want to pin a specific local checkout:
 # skills_dir = "~/src/ai-helpers/plugins/jira/skills/status-analysis"
+
+[tui]
+# Visible review columns, in display order. Omit a name to hide its column.
+# Available: key, summary, target_version, color, action, status, assignee.
+# Or add arbitrary Jira fields using inline tables (label is optional):
+# columns = ["key", {label = "Priority", field = "priority.name"},
+#            {label = "Components", field = "components.name"},
+#            {label = "Team", field = "customfield_12345"}, "color", "action"]
+# Field references are relative to Jira's fields object, using API field IDs.
+# Discover IDs: herald fields "target version"
+# Preview/search values: herald fields "4.22" --issue OCPSTRAT-2666
+# Inspect full objects: herald fields assignee --issue OCPSTRAT-2666 --json
+# A single match prints an entry to paste into columns. Uses [jira] url and
+# JIRA_USERNAME/JIRA_API_TOKEN only; accepts --prefs for another prefs file.
+# Paste into the existing array below, then restart Herald to apply the layout.
+# The helper does not edit this file. Use your instance's custom field IDs.
+# Dotted paths traverse objects and lists; list values are comma-separated.
+# Objects display displayName/name/value/key when present, otherwise JSON.
+# Must be non-empty, with no duplicate names or field references.
+columns = ["key", "summary", "target_version", "color", "action"]
+# Target versions and custom fields load together from Jira on open and r/R.
+# "-" means empty/missing (including unknown/inaccessible fields Jira omits);
+# "Unavailable" means the request failed.
+# Hiding target_version and all custom fields disables these extra lookups.
 
 [profiles.ocpstrat-hcp]
 project = "OCPSTRAT"

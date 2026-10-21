@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -16,6 +17,52 @@ import tomllib
 _SKILL_DIR_REL = Path("plugins/jira/skills/status-analysis")
 _AI_HELPERS_REPO = "https://github.com/openshift-eng/ai-helpers"
 
+TABLE_COLUMNS = {
+    "key": "Key",
+    "summary": "Summary",
+    "target_version": "Target version",
+    "color": "Color",
+    "action": "Action",
+    "status": "Status",
+    "assignee": "Assignee",
+}
+DEFAULT_COLUMNS = ("key", "summary", "target_version", "color", "action")
+
+
+@dataclass(frozen=True)
+class ReviewColumn:
+    key: str
+    label: str
+    field: Optional[str] = None
+
+
+def resolve_columns(columns) -> list[ReviewColumn]:
+    """Validate the ordered list of visible review columns."""
+    if not isinstance(columns, list) or not columns:
+        raise ValueError("[tui] columns must be a non-empty array")
+    resolved = []
+    for column in columns:
+        if isinstance(column, str) and column in TABLE_COLUMNS:
+            resolved.append(ReviewColumn(column, TABLE_COLUMNS[column]))
+        elif isinstance(column, dict) and set(column) <= {"field", "label"}:
+            reference = column.get("field")
+            if not isinstance(reference, str) or not re.fullmatch(
+                r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*", reference,
+            ):
+                raise ValueError("[tui] columns field must be a Jira field ID or dotted field path")
+            label = column.get("label", reference)
+            if not isinstance(label, str) or not label.strip():
+                raise ValueError("[tui] columns label must be a non-empty string")
+            resolved.append(ReviewColumn(f"jira:{reference}", label, reference))
+        else:
+            raise ValueError(
+                "[tui] columns must contain built-in names (" + ", ".join(TABLE_COLUMNS)
+                + ') or tables such as {field = "priority.name", label = "Priority"}'
+            )
+    if len({column.key for column in resolved}) != len(resolved):
+        raise ValueError("[tui] columns must not contain duplicate names or field references")
+    return resolved
+
 
 @dataclass
 class UserPrefs:
@@ -25,6 +72,14 @@ class UserPrefs:
     jira_url: str = "https://redhat.atlassian.net"
     skills_dir: Optional[str] = None
     profiles: dict = field(default_factory=dict)
+    columns: list[str | dict] = field(default_factory=lambda: list(DEFAULT_COLUMNS))
+    resolved_columns: list[ReviewColumn] = field(init=False)
+    target_version_field: str = "customfield_10855"
+
+    def __post_init__(self) -> None:
+        self.resolved_columns = resolve_columns(self.columns)
+        if not isinstance(self.target_version_field, str) or not self.target_version_field.strip():
+            raise ValueError("[jira] target_version_field must be a non-empty field ID")
 
 
 def load_prefs(path: Optional[Path] = None) -> UserPrefs:
@@ -38,6 +93,9 @@ def load_prefs(path: Optional[Path] = None) -> UserPrefs:
         data = tomllib.load(f)
     llm = data.get("llm", {})
     jira = data.get("jira", {})
+    tui = data.get("tui", {})
+    if not isinstance(tui, dict):
+        raise ValueError("[tui] must be a table")
     return UserPrefs(
         model=llm.get("model", "claude-sonnet-5"),
         coding_agent=llm.get("coding_agent"),
@@ -45,6 +103,8 @@ def load_prefs(path: Optional[Path] = None) -> UserPrefs:
         jira_url=jira.get("url", "https://redhat.atlassian.net"),
         skills_dir=jira.get("skills_dir"),
         profiles=data.get("profiles", {}),
+        columns=tui.get("columns", list(DEFAULT_COLUMNS)),
+        target_version_field=jira.get("target_version_field", "customfield_10855"),
     )
 
 

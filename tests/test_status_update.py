@@ -328,7 +328,7 @@ def test_invalid_draft_does_not_start_publication(draft):
     table = MagicMock()
     review = SimpleNamespace(
         _current_key=lambda: "ABC-1", drafts={"ABC-1": draft},
-        _publication_tasks={}, results={}, _col_keys=(0, 1, 2, 3),
+        _publication_tasks={}, results={}, _update_cell=MagicMock(),
         query_one=lambda *args: table,
         app=SimpleNamespace(notify=MagicMock()),
         _start_jira_update=MagicMock(), _advance=MagicMock(),
