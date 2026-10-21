@@ -24,6 +24,40 @@ Source entry points are [`cli.py`](../src/herald/cli.py),
 [`gather.py`](../src/herald/gather.py). The diagram shows conceptual data
 dependencies; the pipeline currently completes batch drafting before review.
 
+## Field discovery and review columns
+
+`herald fields [query] [--issue KEY] [--json]` branches from the CLI before
+resolving the external gatherer or starting the reporting app. It loads prefs
+and Jira credentials, reads the field catalog from `GET /rest/api/3/field`, and
+optionally reads `GET /rest/api/3/issue/<key>?fields=*all`. The destination is
+`prefs.jira_url`. Field discovery does not require a reporting project, GitHub
+credentials, or an LLM client.
+
+[`fields.py`](../src/herald/fields.py) searches names and IDs case-insensitively,
+plus raw JSON values when an issue is supplied. An exact ID match takes
+precedence. Issue fields absent from the catalog are included using their IDs
+as names. Human-readable output contains value previews and a TOML column
+entry for a single match. JSON output preserves full values and distinguishes
+an absent field (`present: false`) from a returned null value. Neither mode
+writes preferences or gathered artifacts.
+
+`[tui] columns` is an ordered array of built-in names and custom entries such
+as `{label = "Priority", field = "priority.name"}`. Custom references resolve
+relative to an issue's `fields` object; dotted paths traverse objects and arrays.
+See the [configuration examples](../README.md#finding-column-fields).
+
+On review mount and single/all-issue refresh, `ReviewScreen._load_jira_columns`
+fetches the visible custom fields and target-version fields in the background.
+It deduplicates root field IDs into one request per issue, with at most ten
+concurrent requests per load. A later refresh supersedes an older response for
+the same issue. Values render as plain text, with `-` for empty/missing values
+and `Unavailable` plus a warning on request failure. Hiding all custom columns
+and `target_version` skips these requests.
+
+These live display values are independent of gathered evidence and draft
+caching: they are not persisted or added to the LLM prompt. Configuring a column
+therefore changes the review display, not the evidence used to generate a draft.
+
 ## Configuration and gathering boundary
 
 `load_prefs` reads the requested TOML file or the XDG configuration location.
