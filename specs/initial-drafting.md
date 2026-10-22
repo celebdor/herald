@@ -13,15 +13,19 @@ The application supplies these request arguments:
 ```python
 await client.messages.create(
     model=model,
-    max_tokens=2048,
+    max_tokens=max_tokens,
     system=system_prompt,
     messages=[{"role": "user", "content": issue_summary}],
 )
 ```
 
 `issue_summary` is a JSON string, not an attached file. The model is selected by
-`--model`, then `[llm].model`, then the configured code default. `max_tokens` is
-an output limit; there is no explicit input truncation or token budgeting here.
+`--model`, then `[llm].model`, then the configured code default. `max_tokens`
+comes from `[llm].max_tokens` (default 8192; invalid values fall back to the
+default) and is an output limit shared with any gateway reasoning tokens. Keep
+it within the selected model's or gateway's output limit, because a truncated
+response is retried at twice that value. There is no explicit input truncation
+or token budgeting here.
 No tools, temperature, conversation history, or structured-output schema are
 passed by this call. There is no explicit `cache_control` in the request;
 identical system prompts alone do not establish an explicit prompt-cache policy.
@@ -201,10 +205,14 @@ prohibit including percentages in the resulting report.
 ## Batch and response behavior
 
 [`batch_draft`](../src/herald/gather.py) permits up to ten issue jobs at a time.
-A drafting exception is retried up to three total attempts with one- and
-two-second delays. Successful SDK responses update token usage. `_first_text`
-returns the first text block; if none exists it currently falls back to a
-thinking block, otherwise raises. There is no stop-reason/truncation check.
+A generic drafting exception is retried up to three total attempts with one- and
+two-second delays. Successful SDK responses update token usage. A response with
+`stop_reason == "max_tokens"` raises `TruncatedResponseError` before any content
+is read. Every drafting path retries a truncation once with `max_tokens` doubled
+and no delay through `call_with_truncation_retry`; a second truncation
+classifies as `draft_failed` rather than returning partial thinking text as an
+invalid draft. Otherwise `_first_text` returns the first text block; if none
+exists it currently falls back to a thinking block, otherwise raises.
 
 Drafts are saved under the platform state directory, scoped by output directory
 and report date; `draft_inputs.json` stores a SHA-256 fingerprint of the exact

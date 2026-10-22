@@ -12,8 +12,12 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pyadf
 
-from .config import _find_cached_gather, _get_state_dir, _save_cache_meta
-from .llm import TokenUsage, draft_ryg
+from .config import (
+    DEFAULT_MAX_TOKENS, _find_cached_gather, _get_state_dir, _save_cache_meta,
+)
+from .llm import (
+    TokenUsage, TruncatedResponseError, call_with_truncation_retry, draft_ryg,
+)
 from .validation import validate_draft
 
 
@@ -437,6 +441,12 @@ def save_drafts(date_dir: Path, drafts: dict) -> None:
 
 # ─── Batch Drafting ──────────────────────────────────────────────────────────
 
+# Generic draft attempts and the base of the exponential backoff between them.
+# Truncation retries use the doubled-budget helper in llm.py instead.
+DRAFT_MAX_ATTEMPTS = 3
+DRAFT_RETRY_BACKOFF_BASE = 2
+
+
 async def batch_draft(
     client,
     model: str,
@@ -448,15 +458,17 @@ async def batch_draft(
     only_significant: bool = False,
     manifest: Optional[dict] = None,
     force_redraft: bool = False,
+    *,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
 ) -> tuple:
     """Return drafts, summaries, failed keys, and per-key outcomes.
 
     Outcomes are drafted, quiet_skip, missing_data, draft_failed, or invalid_draft.
+    A truncated response is retried once with the output budget doubled.
     """
     saved = {} if force_redraft else load_saved_drafts(date_dir)
     saved_inputs = _load_draft_inputs(date_dir)
     sem = asyncio.Semaphore(10)
-    max_retries = 3
 
     async def draft_one(issue, idx):
         async with sem:
@@ -491,10 +503,23 @@ async def batch_draft(
                         await callback(idx + 1, len(issues), f"Loaded {key} (cached draft)")
                     return key, saved[key], summary, "drafted"
 
+            async def on_truncation_retry(cap):
+                msg = f"Truncated {key}; retrying with max_tokens={cap}"
+                print(f"Warning: {msg}", file=sys.stderr)
+                if callback:
+                    await callback(idx + 1, len(issues), msg)
+
             last_err = None
-            for attempt in range(max_retries):
+            for attempt in range(1, DRAFT_MAX_ATTEMPTS + 1):
                 try:
-                    draft = await draft_ryg(client, model, system_prompt, summary, usage)
+                    draft = await call_with_truncation_retry(
+                        lambda cap: draft_ryg(
+                            client, model, system_prompt, summary, usage,
+                            max_tokens=cap,
+                        ),
+                        max_tokens,
+                        on_truncation_retry,
+                    )
                     _, validation_error = validate_draft(draft)
                     if validation_error:
                         msg = f"Invalid draft for {key}: {validation_error}"
@@ -504,12 +529,17 @@ async def batch_draft(
                     if callback:
                         await callback(idx + 1, len(issues), f"Drafted {key}")
                     return key, draft, summary, "drafted"
+                except TruncatedResponseError as e:
+                    last_err = e
+                    # A second truncation is terminal; the helper already used
+                    # the one doubled-budget retry.
+                    break
                 except Exception as e:
                     last_err = e
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(2 ** attempt)
+                    if attempt < DRAFT_MAX_ATTEMPTS:
+                        await asyncio.sleep(DRAFT_RETRY_BACKOFF_BASE ** (attempt - 1))
 
-            msg = f"Failed {key} (draft, {max_retries} attempts): {last_err}"
+            msg = f"Failed {key} (draft, {attempt} attempts): {last_err}"
             print(f"Warning: {msg}", file=sys.stderr)
             if callback:
                 await callback(idx + 1, len(issues), msg)

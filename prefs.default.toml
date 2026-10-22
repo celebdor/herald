@@ -3,6 +3,11 @@
 
 [llm]
 model = "claude-sonnet-5"
+# Output token ceiling per API call. Gateway models that emit reasoning tokens
+# share this budget with the draft, so leave headroom above the ~100-200 token
+# report. Must not exceed the model's or gateway's output limit: a truncated
+# response is retried at twice this value. See DEFAULT_MAX_TOKENS in config.py.
+# max_tokens = 8192
 # Coding agent CLI for the "request changes" feature (i).
 # When set, revisions are handled by this agent — it can search GitHub,
 # fetch PR details, etc.  Supported values: "claude", "pi", "opencode".

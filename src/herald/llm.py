@@ -1,5 +1,6 @@
 """LLM client creation, cost tracking, drafting, and system prompt building."""
 
+import inspect
 import json
 import os
 import sys
@@ -9,7 +10,7 @@ from typing import Optional
 
 import anthropic
 
-from .config import UserPrefs, find_skills_dir
+from .config import DEFAULT_MAX_TOKENS, UserPrefs, find_skills_dir
 
 
 _TEMPORAL_EVIDENCE_RULES = (
@@ -120,8 +121,29 @@ class TokenUsage:
         )
 
 
-def _first_text(response) -> str:
-    """Return the text of the first TextBlock, skipping any ThinkingBlocks."""
+# Multiplier applied to max_tokens when a truncated response is retried.
+TRUNCATION_RETRY_FACTOR = 2
+
+
+class TruncatedResponseError(RuntimeError):
+    """The response hit max_tokens before a complete draft was produced."""
+
+
+def _first_text(response, max_tokens: Optional[int] = None) -> str:
+    """Return the text of the first TextBlock, skipping any ThinkingBlocks.
+
+    A gateway model that emits reasoning tokens shares max_tokens with the
+    answer, so ``stop_reason == "max_tokens"`` usually means the thinking trace
+    consumed the whole budget. Surface that as a truncation instead of returning
+    partial thinking text that will fail draft validation. A capped response is
+    retried even when it contains a TextBlock, because the visible draft may be
+    cut off mid-sentence.
+    """
+    if getattr(response, "stop_reason", None) == "max_tokens":
+        limit = f" at max_tokens={max_tokens}" if max_tokens is not None else ""
+        raise TruncatedResponseError(
+            f"Response was truncated{limit} before a complete draft was produced"
+        )
     for block in response.content:
         if hasattr(block, "text"):
             return block.text
@@ -131,27 +153,47 @@ def _first_text(response) -> str:
     raise ValueError(f"No usable content in response: {response.content}")
 
 
+async def call_with_truncation_retry(call, max_tokens: int, on_retry=None) -> str:
+    """Call ``call(max_tokens)``, retrying once with a doubled cap on truncation.
+
+    ``call`` receives the effective output budget. ``on_retry`` is invoked with
+    the new budget before the retry and may be sync or async. A second
+    truncation propagates to the caller.
+    """
+    try:
+        return await call(max_tokens)
+    except TruncatedResponseError:
+        retry_max_tokens = max_tokens * TRUNCATION_RETRY_FACTOR
+        if on_retry is not None:
+            result = on_retry(retry_max_tokens)
+            if inspect.isawaitable(result):
+                await result
+        return await call(retry_max_tokens)
+
+
 async def draft_ryg(
-    client, model: str, system_prompt: str, issue_summary: str, usage: TokenUsage
+    client, model: str, system_prompt: str, issue_summary: str, usage: TokenUsage,
+    *, max_tokens: int = DEFAULT_MAX_TOKENS,
 ) -> str:
     """Draft R/Y/G status for one issue. One independent API call."""
     response = await client.messages.create(
         model=model,
-        max_tokens=2048,
+        max_tokens=max_tokens,
         system=system_prompt,
         messages=[{"role": "user", "content": issue_summary}],
     )
     usage.add(response)
-    return _first_text(response)
+    return _first_text(response, max_tokens)
 
 
 async def request_changes_api(
     client, model: str, draft: str, issue_summary: str, instruction: str, usage: TokenUsage,
+    *, max_tokens: int = DEFAULT_MAX_TOKENS,
 ) -> str:
     """Revise a draft via a single Anthropic API call (no tool access)."""
     response = await client.messages.create(
         model=model,
-        max_tokens=2048,
+        max_tokens=max_tokens,
         system=(
             "You are revising a Jira R/Y/G status update. Output ONLY the revised "
             "status update in the exact same format.\n\n"
@@ -168,7 +210,7 @@ async def request_changes_api(
         }],
     )
     usage.add(response)
-    return _first_text(response)
+    return _first_text(response, max_tokens)
 
 
 def build_system_prompt(prefs: UserPrefs) -> str:

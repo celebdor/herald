@@ -12,7 +12,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from herald.app import ReviewResult, ReviewScreen, edit_in_editor, extract_color, publish_validated_draft
-from herald.config import UserPrefs, find_scripts_dir, find_skills_dir, load_prefs
+from herald.config import (
+    DEFAULT_MAX_TOKENS, UserPrefs, find_scripts_dir, find_skills_dir, load_prefs,
+)
 from herald.gather import (
     _field_to_text,
     _prune_issue,
@@ -21,7 +23,15 @@ from herald.gather import (
     batch_draft,
 )
 from herald.jira import _normalized_adf, get_jira_auth, update_jira_status
-from herald.llm import TokenUsage, build_system_prompt
+from herald.llm import (
+    TokenUsage,
+    TruncatedResponseError,
+    _first_text,
+    build_system_prompt,
+    call_with_truncation_retry,
+    draft_ryg,
+    request_changes_api,
+)
 
 
 # ─── build_system_prompt ─────────────────────────────────────────────────────
@@ -62,11 +72,125 @@ def test_build_system_prompt_missing_files_silently_skipped(tmp_path):
     assert "You are a Jira status analyst" in prompt
 
 
+# ─── stop_reason handling ────────────────────────────────────────────────────
+
+def test_first_text_skips_thinking_blocks():
+    response = SimpleNamespace(
+        stop_reason="end_turn",
+        content=[
+            SimpleNamespace(thinking="reasoning about the evidence"),
+            SimpleNamespace(text="* Color Status: Green\nUpdate"),
+        ],
+    )
+    assert _first_text(response) == "* Color Status: Green\nUpdate"
+
+
+def test_first_text_falls_back_to_thinking_without_a_text_block():
+    response = SimpleNamespace(
+        stop_reason="end_turn",
+        content=[SimpleNamespace(thinking="reasoning only")],
+    )
+    assert _first_text(response) == "reasoning only"
+
+
+def test_first_text_raises_when_response_hits_max_tokens():
+    response = SimpleNamespace(
+        stop_reason="max_tokens",
+        content=[
+            SimpleNamespace(thinking="long reasoning trace"),
+            SimpleNamespace(text="partial output"),
+        ],
+    )
+    with pytest.raises(TruncatedResponseError, match="max_tokens=8192"):
+        _first_text(response, 8192)
+
+
+def test_call_with_truncation_retry_doubles_cap_and_notifies():
+    caps = []
+    notices = []
+
+    async def call(max_tokens):
+        caps.append(max_tokens)
+        if len(caps) == 1:
+            raise TruncatedResponseError("truncated")
+        return "complete draft"
+
+    result = asyncio.run(call_with_truncation_retry(call, 4096, notices.append))
+
+    assert result == "complete draft"
+    assert caps == [4096, 8192]
+    assert notices == [8192]
+
+
+def test_call_with_truncation_retry_propagates_second_truncation():
+    caps = []
+
+    async def call(max_tokens):
+        caps.append(max_tokens)
+        raise TruncatedResponseError("truncated")
+
+    with pytest.raises(TruncatedResponseError):
+        asyncio.run(call_with_truncation_retry(call, 4096))
+    assert caps == [4096, 8192]
+
+
+def test_draft_ryg_sends_configured_max_tokens_and_raises_on_truncation():
+    captured = {}
+
+    class Messages:
+        async def create(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                stop_reason="max_tokens",
+                content=[SimpleNamespace(thinking="reasoning only")],
+                usage=SimpleNamespace(
+                    input_tokens=10, output_tokens=8192,
+                    cache_creation_input_tokens=0, cache_read_input_tokens=0,
+                ),
+            )
+
+    usage = TokenUsage()
+    with pytest.raises(TruncatedResponseError):
+        asyncio.run(draft_ryg(
+            SimpleNamespace(messages=Messages()), "model", "system", "summary", usage,
+            max_tokens=4096,
+        ))
+    assert captured["max_tokens"] == 4096
+    assert usage.calls == 1
+    assert usage.output_tokens == 8192
+
+
+def test_request_changes_api_sends_configured_max_tokens_and_raises_on_truncation():
+    captured = {}
+
+    class Messages:
+        async def create(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                stop_reason="max_tokens",
+                content=[SimpleNamespace(thinking="reasoning only")],
+                usage=SimpleNamespace(
+                    input_tokens=10, output_tokens=4096,
+                    cache_creation_input_tokens=0, cache_read_input_tokens=0,
+                ),
+            )
+
+    usage = TokenUsage()
+    with pytest.raises(TruncatedResponseError):
+        asyncio.run(request_changes_api(
+            SimpleNamespace(messages=Messages()), "model", "draft", "summary",
+            "instruction", usage, max_tokens=4096,
+        ))
+    assert captured["max_tokens"] == 4096
+    assert usage.calls == 1
+
+
 # ─── load_prefs ──────────────────────────────────────────────────────────────
 
 def test_load_prefs_defaults_when_file_missing(tmp_path):
     prefs = load_prefs(tmp_path / "nonexistent.toml")
     assert prefs.model == "claude-sonnet-5"
+    assert prefs.max_tokens == DEFAULT_MAX_TOKENS
     assert prefs.writing_rules == []
     assert prefs.jira_url == "https://redhat.atlassian.net"
     assert prefs.profiles == {}
@@ -76,6 +200,7 @@ def test_load_prefs_from_toml(tmp_path):
     content = """
 [llm]
 model = "claude-haiku-4-5"
+max_tokens = 4096
 writing_rules = ["No fractions", "No percentages"]
 
 [jira]
@@ -91,6 +216,7 @@ project = "TEST"
     prefs = load_prefs(prefs_file)
 
     assert prefs.model == "claude-haiku-4-5"
+    assert prefs.max_tokens == 4096
     assert "No fractions" in prefs.writing_rules
     assert prefs.jira_url == "https://example.atlassian.net"
     assert prefs.skills_dir == "/custom/skills"
@@ -102,7 +228,15 @@ def test_load_prefs_partial_fills_defaults(tmp_path):
     prefs_file.write_text("[llm]\nmodel = \"claude-opus-5\"\n")
     prefs = load_prefs(prefs_file)
     assert prefs.model == "claude-opus-5"
+    assert prefs.max_tokens == DEFAULT_MAX_TOKENS
     assert prefs.writing_rules == []
+
+
+@pytest.mark.parametrize("value", ["8192", 0, -1, True, 1.5, 1_000_001])
+def test_load_prefs_rejects_invalid_max_tokens(tmp_path, value):
+    prefs_file = tmp_path / "prefs.toml"
+    prefs_file.write_text(f"[llm]\nmax_tokens = {json.dumps(value)}\n")
+    assert load_prefs(prefs_file).max_tokens == DEFAULT_MAX_TOKENS
 
 
 # ─── TokenUsage.cost ─────────────────────────────────────────────────────────
@@ -383,7 +517,7 @@ def test_batch_draft_rejects_malformed_llm_output(tmp_path, monkeypatch):
     issue_dir.mkdir()
     (issue_dir / "ABC-1.json").write_text(json.dumps({"issue": {"key": "ABC-1"}}))
 
-    async def malformed(*args):
+    async def malformed(*args, **kwargs):
         return "No status here"
 
     monkeypatch.setattr(gather, "draft_ryg", malformed)
@@ -402,7 +536,7 @@ def test_batch_draft_classifies_llm_failure_separately(tmp_path, monkeypatch):
     issue_dir.mkdir()
     (issue_dir / "ABC-1.json").write_text(json.dumps({"issue": {"key": "ABC-1"}}))
 
-    async def broken(*args):
+    async def broken(*args, **kwargs):
         raise RuntimeError("offline")
 
     async def no_wait(*args):
@@ -416,6 +550,235 @@ def test_batch_draft_classifies_llm_failure_separately(tmp_path, monkeypatch):
     assert drafts == {}
     assert failed == ["ABC-1"]
     assert outcomes == {"ABC-1": "draft_failed"}
+
+
+def test_batch_draft_classifies_truncation_as_draft_failure(tmp_path, monkeypatch):
+    from herald import gather
+
+    issue_dir = tmp_path / "issues"
+    issue_dir.mkdir()
+    (issue_dir / "ABC-1.json").write_text(json.dumps({"issue": {"key": "ABC-1"}}))
+    caps = []
+
+    async def truncated(client, model, prompt, summary, usage, *, max_tokens):
+        caps.append(max_tokens)
+        raise TruncatedResponseError("Response was truncated at max_tokens=8192")
+
+    monkeypatch.setattr(gather, "draft_ryg", truncated)
+    drafts, summaries, failed, outcomes = asyncio.run(batch_draft(
+        None, "model", "prompt", tmp_path, [{"key": "ABC-1"}], TokenUsage()
+    ))
+    assert caps == [DEFAULT_MAX_TOKENS, DEFAULT_MAX_TOKENS * 2]
+    assert drafts == {}
+    assert failed == ["ABC-1"]
+    assert outcomes == {"ABC-1": "draft_failed"}
+
+
+def test_batch_draft_retries_truncation_with_doubled_cap(tmp_path, monkeypatch):
+    from herald import gather
+
+    issue_dir = tmp_path / "issues"
+    issue_dir.mkdir()
+    (issue_dir / "ABC-1.json").write_text(json.dumps({"issue": {"key": "ABC-1"}}))
+    caps = []
+
+    async def truncated_then_ok(client, model, prompt, summary, usage, *, max_tokens):
+        caps.append(max_tokens)
+        if len(caps) == 1:
+            raise TruncatedResponseError("truncated")
+        return "* Color Status: Green\nUpdate"
+
+    monkeypatch.setattr(gather, "draft_ryg", truncated_then_ok)
+    drafts, _, failed, outcomes = asyncio.run(batch_draft(
+        None, "model", "prompt", tmp_path, [{"key": "ABC-1"}], TokenUsage(),
+        max_tokens=4096,
+    ))
+    assert caps == [4096, 8192]
+    assert failed == []
+    assert outcomes == {"ABC-1": "drafted"}
+    assert drafts["ABC-1"].startswith("* Color Status: Green")
+
+
+def test_batch_draft_retries_truncation_after_prior_failures(tmp_path, monkeypatch):
+    from herald import gather
+
+    issue_dir = tmp_path / "issues"
+    issue_dir.mkdir()
+    (issue_dir / "ABC-1.json").write_text(json.dumps({"issue": {"key": "ABC-1"}}))
+    caps = []
+
+    async def fail_then_truncate(client, model, prompt, summary, usage, *, max_tokens):
+        caps.append(max_tokens)
+        if len(caps) == 1:
+            raise RuntimeError("transient")
+        if len(caps) == 2:
+            raise TruncatedResponseError("truncated")
+        return "* Color Status: Green\nUpdate"
+
+    async def no_wait(*args):
+        return None
+
+    monkeypatch.setattr(gather, "draft_ryg", fail_then_truncate)
+    monkeypatch.setattr(gather.asyncio, "sleep", no_wait)
+    drafts, _, failed, outcomes = asyncio.run(batch_draft(
+        None, "model", "prompt", tmp_path, [{"key": "ABC-1"}], TokenUsage(),
+        max_tokens=4096,
+    ))
+    assert caps == [4096, 4096, 8192]
+    assert failed == []
+    assert outcomes == {"ABC-1": "drafted"}
+
+
+def test_batch_draft_forwards_max_tokens(tmp_path, monkeypatch):
+    from herald import gather
+
+    issue_dir = tmp_path / "issues"
+    issue_dir.mkdir()
+    (issue_dir / "ABC-1.json").write_text(json.dumps({"issue": {"key": "ABC-1"}}))
+    seen = {}
+
+    async def capture(client, model, prompt, summary, usage, *, max_tokens):
+        seen["max_tokens"] = max_tokens
+        return "* Color Status: Green\nUpdate"
+
+    monkeypatch.setattr(gather, "draft_ryg", capture)
+    drafts, _, _, outcomes = asyncio.run(batch_draft(
+        None, "model", "prompt", tmp_path, [{"key": "ABC-1"}], TokenUsage(),
+        max_tokens=4096,
+    ))
+    assert seen["max_tokens"] == 4096
+    assert outcomes == {"ABC-1": "drafted"}
+
+
+# ─── truncation retry in the review TUI ──────────────────────────────────────
+
+def _review_shim(**overrides):
+    values = dict(
+        client=None,
+        model="model",
+        usage=TokenUsage(),
+        max_tokens=4096,
+        drafts={"ABC-1": "old draft"},
+        summaries={},
+        outcomes={},
+        results={},
+        date_dir=None,
+        _save_drafts=MagicMock(),
+        _update_draft_panel=MagicMock(),
+        _col_keys=(0, 1, 2, 3),
+        query_one=lambda *args: MagicMock(),
+        app=SimpleNamespace(notify=MagicMock()),
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_request_changes_retries_truncation_with_doubled_cap(monkeypatch):
+    from herald import app as app_module
+
+    caps = []
+
+    async def fake(client, model, draft, summary, instruction, usage, *, max_tokens):
+        caps.append(max_tokens)
+        if len(caps) == 1:
+            raise TruncatedResponseError("truncated")
+        return "* Color Status: Green\nUpdate"
+
+    monkeypatch.setattr(app_module, "request_changes_api", fake)
+    review = _review_shim()
+    asyncio.run(ReviewScreen._do_request_changes(
+        review, "ABC-1", "old draft", "summary", "change it"
+    ))
+
+    assert caps == [4096, 8192]
+    assert review.outcomes == {"ABC-1": "drafted"}
+    assert review.drafts["ABC-1"].startswith("* Color Status: Green")
+    review.app.notify.assert_called_once()
+
+
+def test_request_changes_reports_failure_after_second_truncation(monkeypatch):
+    from herald import app as app_module
+
+    async def always_truncated(client, model, draft, summary, instruction, usage, *, max_tokens):
+        raise TruncatedResponseError("truncated")
+
+    monkeypatch.setattr(app_module, "request_changes_api", always_truncated)
+    review = _review_shim()
+    asyncio.run(ReviewScreen._do_request_changes(
+        review, "ABC-1", "old draft", "summary", "change it"
+    ))
+
+    assert review.outcomes == {}
+    assert review.drafts["ABC-1"] == "old draft"
+    titles = [call.kwargs.get("title") for call in review.app.notify.call_args_list]
+    assert "Revision failed" in titles
+
+
+def test_refresh_retries_truncation_with_doubled_cap(tmp_path, monkeypatch):
+    from herald import app as app_module
+
+    (tmp_path / "issues").mkdir()
+    (tmp_path / "issues" / "ABC-1.json").write_text(
+        json.dumps({"issue": {"key": "ABC-1"}})
+    )
+    caps = []
+
+    async def fake_gather(*args, **kwargs):
+        return tmp_path, {}
+
+    async def fake_draft(client, model, prompt, summary, usage, *, max_tokens):
+        caps.append(max_tokens)
+        if len(caps) == 1:
+            raise TruncatedResponseError("truncated")
+        return "* Color Status: Green\nUpdate"
+
+    monkeypatch.setattr(app_module, "run_gather", fake_gather)
+    monkeypatch.setattr(app_module, "draft_ryg", fake_draft)
+    monkeypatch.setattr(app_module, "_prune_issue", lambda data, manifest: {"key": "ABC-1"})
+    monkeypatch.setattr(app_module, "save_draft_input", lambda *args: None)
+
+    review = _review_shim(
+        scripts_dir=tmp_path,
+        args=SimpleNamespace(output_dir=str(tmp_path / "out")),
+        system_prompt="system",
+        drafts={},
+    )
+    asyncio.run(ReviewScreen._do_refresh(review, "ABC-1"))
+
+    assert caps == [4096, 8192]
+    assert review.outcomes == {"ABC-1": "drafted"}
+    assert review.drafts["ABC-1"].startswith("* Color Status: Green")
+
+
+def test_refresh_reports_failure_after_second_truncation(tmp_path, monkeypatch):
+    from herald import app as app_module
+
+    (tmp_path / "issues").mkdir()
+    (tmp_path / "issues" / "ABC-1.json").write_text(
+        json.dumps({"issue": {"key": "ABC-1"}})
+    )
+
+    async def fake_gather(*args, **kwargs):
+        return tmp_path, {}
+
+    async def always_truncated(client, model, prompt, summary, usage, *, max_tokens):
+        raise TruncatedResponseError("truncated")
+
+    monkeypatch.setattr(app_module, "run_gather", fake_gather)
+    monkeypatch.setattr(app_module, "draft_ryg", always_truncated)
+    monkeypatch.setattr(app_module, "_prune_issue", lambda data, manifest: {"key": "ABC-1"})
+
+    review = _review_shim(
+        scripts_dir=tmp_path,
+        args=SimpleNamespace(output_dir=str(tmp_path / "out")),
+        system_prompt="system",
+        drafts={},
+    )
+    asyncio.run(ReviewScreen._do_refresh(review, "ABC-1"))
+
+    assert review.outcomes == {"ABC-1": "draft_failed"}
+    titles = [call.kwargs.get("title") for call in review.app.notify.call_args_list]
+    assert "Refresh failed" in titles
 
 
 # ─── find_scripts_dir / find_skills_dir ──────────────────────────────────────

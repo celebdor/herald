@@ -115,7 +115,7 @@ review-decision storage.
 | Revision path | Inputs | Access / output |
 | --- | --- | --- |
 | `$EDITOR` | Current draft in a temporary Markdown file | User edits locally; resulting text replaces and saves the draft; comment lines beginning `#` are removed |
-| API revision | Reduced issue summary, current draft, user's instruction | One Anthropic/Vertex call with the temporal evidence rules and formatting instruction; no tools or conversation history; output limit 2048 |
+| API revision | Reduced issue summary, current draft, user's instruction | One Anthropic/Vertex call with the temporal evidence rules and formatting instruction; no tools or conversation history; output limit from `[llm].max_tokens` (default 8192) |
 | Coding-agent revision | Summary, instruction, temporary draft path, gathered issue/data-directory paths when available | External CLI receives the temporal evidence rules, can read fuller gathered JSON and use tools such as `gh`; revised draft file is read back and saved |
 
 API revisions do not reuse the initial analysis documents or writing-rules

@@ -16,10 +16,31 @@ import tomllib
 _SKILL_DIR_REL = Path("plugins/jira/skills/status-analysis")
 _AI_HELPERS_REPO = "https://github.com/openshift-eng/ai-helpers"
 
+# Output ceiling per API call. Gateway models that emit reasoning tokens spend
+# this same budget on thinking, so leave ample room above the ~100-200 token
+# R/Y/G report. It must not exceed the selected model's or gateway's max output
+# limit; a truncated response is retried at twice this value.
+DEFAULT_MAX_TOKENS = 8192
+
+# Sanity bound for configured values; real output limits are provider-specific.
+MAX_CONFIGURED_MAX_TOKENS = 1_000_000
+
+
+def _coerce_max_tokens(value: object) -> int:
+    """Return a positive integer max_tokens, or the default for bad input."""
+    if (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 < value <= MAX_CONFIGURED_MAX_TOKENS
+    ):
+        return value
+    return DEFAULT_MAX_TOKENS
+
 
 @dataclass
 class UserPrefs:
     model: str = "claude-sonnet-5"
+    max_tokens: int = DEFAULT_MAX_TOKENS
     coding_agent: Optional[str] = None
     writing_rules: list = field(default_factory=list)
     jira_url: str = "https://redhat.atlassian.net"
@@ -40,6 +61,7 @@ def load_prefs(path: Optional[Path] = None) -> UserPrefs:
     jira = data.get("jira", {})
     return UserPrefs(
         model=llm.get("model", "claude-sonnet-5"),
+        max_tokens=_coerce_max_tokens(llm.get("max_tokens")),
         coding_agent=llm.get("coding_agent"),
         writing_rules=llm.get("writing_rules", []),
         jira_url=jira.get("url", "https://redhat.atlassian.net"),

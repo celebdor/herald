@@ -18,7 +18,7 @@ from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Input, ProgressBar, RichLog, Static
 
 from .agent import _resolve_coding_agent, _run_agent_interactive
-from .config import UserPrefs
+from .config import DEFAULT_MAX_TOKENS, UserPrefs
 from .gather import (
     _drafts_path,
     _prune_issue,
@@ -32,6 +32,7 @@ from .jira import get_jira_auth, update_jira_status
 from .llm import (
     TokenUsage,
     build_system_prompt,
+    call_with_truncation_retry,
     create_client,
     draft_ryg,
     fetch_model_pricing,
@@ -201,6 +202,7 @@ class ReviewScreen(Screen):
         self.auth_headers = auth_headers
         self.date_dir = date_dir
         self.prefs = prefs
+        self.max_tokens = getattr(prefs, "max_tokens", DEFAULT_MAX_TOKENS)
         self.scripts_dir = scripts_dir
         self.args = args
         self.system_prompt = system_prompt
@@ -525,8 +527,15 @@ class ReviewScreen(Screen):
             self.summaries[key] = summary
 
             table.update_cell(key, self._col_keys[3], "Drafting…")
-            draft = await draft_ryg(
-                self.client, self.model, self.system_prompt, summary, self.usage,
+            draft = await call_with_truncation_retry(
+                lambda cap: draft_ryg(
+                    self.client, self.model, self.system_prompt, summary, self.usage,
+                    max_tokens=cap,
+                ),
+                self.max_tokens,
+                on_retry=lambda cap: self.app.notify(
+                    f"{key} draft truncated; retrying with max_tokens={cap}"
+                ),
             )
             self.drafts[key] = draft
             _, validation_error = validate_draft(draft)
@@ -578,7 +587,7 @@ class ReviewScreen(Screen):
             drafts, summaries, failed, outcomes = await batch_draft(
                 self.client, self.model, self.system_prompt, date_dir,
                 manifest["issues"], self.usage, manifest=manifest,
-                force_redraft=True,
+                force_redraft=True, max_tokens=self.max_tokens,
             )
             for key in outcomes:
                 self.drafts.pop(key, None)
@@ -661,8 +670,15 @@ class ReviewScreen(Screen):
 
     async def _do_request_changes(self, key, draft, summary, instruction):
         try:
-            revised = await request_changes_api(
-                self.client, self.model, draft, summary, instruction, self.usage,
+            revised = await call_with_truncation_retry(
+                lambda cap: request_changes_api(
+                    self.client, self.model, draft, summary, instruction, self.usage,
+                    max_tokens=cap,
+                ),
+                self.max_tokens,
+                on_retry=lambda cap: self.app.notify(
+                    f"{key} revision truncated; retrying with max_tokens={cap}"
+                ),
             )
             self.drafts[key] = revised
             _, validation_error = validate_draft(revised)
@@ -821,6 +837,7 @@ class StatusUpdateApp(App):
                 only_significant=only_significant,
                 manifest=manifest,
                 force_redraft=getattr(args, "redraft", False),
+                max_tokens=prefs.max_tokens,
             )
             quiet = sum(state == "quiet_skip" for state in outcomes.values())
             missing = sum(state == "missing_data" for state in outcomes.values())
