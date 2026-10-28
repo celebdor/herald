@@ -917,22 +917,32 @@ def test_profile_does_not_override_explicitly_set_args():
 
 # ─── run_gather window derivation ────────────────────────────────────────────
 
-class _FakeGatherProc:
-    returncode = 0
+class _FakeStdoutReader:
+    """Stands in for proc.stdout: one async read() of the whole payload."""
 
-    def __init__(self, stdout_bytes):
-        self._stdout_bytes = stdout_bytes
-        self.stdout = self
-        self.stderr = self
+    def __init__(self, data):
+        self._data = data
 
     async def read(self):
-        return self._stdout_bytes
+        return self._data
+
+
+class _FakeStderrStream:
+    """Stands in for proc.stderr: an empty async line stream."""
 
     def __aiter__(self):
         return self
 
     async def __anext__(self):
         raise StopAsyncIteration
+
+
+class _FakeGatherProc:
+    returncode = 0
+
+    def __init__(self, stdout_bytes):
+        self.stdout = _FakeStdoutReader(stdout_bytes)
+        self.stderr = _FakeStderrStream()
 
     async def wait(self):
         return 0
