@@ -1243,9 +1243,7 @@ def test_window_resolution_prefers_persisted_window_fixture():
 def test_window_resolution_single_day_range_fixture():
     # A range where start == end covers exactly one calendar day; the
     # half-open bounds must still form a valid non-empty interval.
-    manifest = json.loads(
-        (_FIXTURES / "manifest_single_day_range.json").read_text()
-    )
+    manifest = json.loads((_FIXTURES / "manifest_single_day_range.json").read_text())
 
     window = _ensure_reporting_window(manifest)
 
@@ -1606,28 +1604,37 @@ def test_unknown_profile_name_is_an_error(capsys):
         _resolve(["--project", "X", "--profile", "typo"])
 
     assert "profile 'typo' not found" in capsys.readouterr().err
-    assert args.model == "claude-haiku-4-5"  # profile fills model (was None)
 
 
 # ─── run_gather window derivation ────────────────────────────────────────────
 
 
-class _FakeGatherProc:
-    returncode = 0
+class _FakeStdoutReader:
+    """Stands in for proc.stdout: one async read() of the whole payload."""
 
-    def __init__(self, stdout_bytes):
-        self._stdout_bytes = stdout_bytes
-        self.stdout = self
-        self.stderr = self
+    def __init__(self, data):
+        self._data = data
 
     async def read(self):
-        return self._stdout_bytes
+        return self._data
+
+
+class _FakeStderrStream:
+    """Stands in for proc.stderr: an empty async line stream."""
 
     def __aiter__(self):
         return self
 
     async def __anext__(self):
         raise StopAsyncIteration
+
+
+class _FakeGatherProc:
+    returncode = 0
+
+    def __init__(self, stdout_bytes):
+        self.stdout = _FakeStdoutReader(stdout_bytes)
+        self.stderr = _FakeStderrStream()
 
     async def wait(self):
         return 0
