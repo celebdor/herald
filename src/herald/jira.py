@@ -5,9 +5,15 @@ import json
 import os
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import quote
 
 import aiohttp
 import pyadf
+
+
+def _issue_url(jira_url: str, issue_key: str) -> str:
+    """Build an issue API URL; the quoted key stays a single path segment."""
+    return f"{jira_url.rstrip('/')}/rest/api/3/issue/{quote(issue_key, safe='')}"
 
 
 def _text_to_adf(text: str) -> dict:
@@ -42,6 +48,74 @@ def _normalized_adf(value):
     return value
 
 
+async def get_jira_fields(
+    session: aiohttp.ClientSession, jira_url: str, auth_headers: dict,
+) -> list[dict]:
+    """Return the system and custom field catalog visible to this user."""
+    async with session.get(
+        f"{jira_url.rstrip('/')}/rest/api/3/field",
+        headers=auth_headers,
+        timeout=aiohttp.ClientTimeout(total=30),
+    ) as resp:
+        resp.raise_for_status()
+        return await resp.json()
+
+
+async def get_issue_fields(
+    session: aiohttp.ClientSession,
+    jira_url: str,
+    auth_headers: dict,
+    issue_key: str,
+    field_ids: list[str],
+) -> dict:
+    """Read all requested display fields in one request per issue."""
+    async with session.get(
+        _issue_url(jira_url, issue_key),
+        params={"fields": ",".join(dict.fromkeys(field_ids))},
+        headers=auth_headers,
+        timeout=aiohttp.ClientTimeout(total=30),
+    ) as resp:
+        resp.raise_for_status()
+        return (await resp.json())["fields"]
+
+
+def jira_field_value(fields: dict, reference: str):
+    """Resolve a field path relative to Jira's fields object, including lists."""
+    def descend(value, parts):
+        if not parts:
+            return value
+        if isinstance(value, list):
+            return [descend(item, parts) for item in value]
+        if isinstance(value, dict):
+            return descend(value.get(parts[0]), parts[1:])
+        return None
+
+    return descend(fields, reference.split("."))
+
+
+def format_jira_field(value) -> str:
+    """Render Jira scalars, arrays and objects as a single table cell."""
+    def render(item):
+        if item is None:
+            return ""
+        if isinstance(item, str):
+            return " ".join(item.split())
+        if isinstance(item, bool):
+            return str(item).lower()
+        if isinstance(item, list):
+            return ", ".join(dict.fromkeys(text for child in item if (text := render(child))))
+        if isinstance(item, dict):
+            if not item:
+                return ""
+            for key in ("displayName", "name", "value", "key"):
+                if key in item and item[key] is not None:
+                    return render(item[key])
+            return json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+        return str(item)
+
+    return render(value) or "-"
+
+
 async def update_jira_status(
     session: aiohttp.ClientSession,
     jira_url: str,
@@ -53,7 +127,7 @@ async def update_jira_status(
 
     After a successful PUT, reads the field back to verify it actually changed.
     """
-    url = f"{jira_url}/rest/api/3/issue/{issue_key}"
+    url = _issue_url(jira_url, issue_key)
     payload = {"fields": {"customfield_10814": _text_to_adf(status_text)}}
     try:
         async with session.put(url, json=payload, headers=auth_headers) as resp:
@@ -76,9 +150,11 @@ async def update_jira_status(
             "unconfirmed",
         )
 
-    verify_url = f"{jira_url}/rest/api/3/issue/{issue_key}?fields=customfield_10814"
+    verify_url = _issue_url(jira_url, issue_key)
     try:
-        async with session.get(verify_url, headers=auth_headers) as resp:
+        async with session.get(
+            verify_url, headers=auth_headers, params={"fields": "customfield_10814"},
+        ) as resp:
             if resp.status not in (200, 204):
                 return JiraUpdateResult(
                     False,

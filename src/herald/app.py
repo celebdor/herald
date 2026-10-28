@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import os
 import subprocess
 import tempfile
@@ -10,6 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 import aiohttp
+from rich.text import Text
 
 from textual import events
 from textual.app import App, ComposeResult
@@ -28,7 +30,10 @@ from .gather import (
     save_drafts,
     save_draft_input,
 )
-from .jira import get_jira_auth, update_jira_status
+from .jira import (
+    format_jira_field, get_issue_fields, get_jira_auth, jira_field_value,
+    update_jira_status,
+)
 from .llm import (
     TokenUsage,
     build_system_prompt,
@@ -39,10 +44,20 @@ from .llm import (
 )
 from .validation import validate_draft
 
+logger = logging.getLogger(__name__)
+
+
 def extract_color(draft: str) -> str:
     """Extract an unambiguous R/Y/G color, otherwise report Unknown."""
     color, _ = validate_draft(draft)
     return color or "Unknown"
+
+
+def _manifest_text(value, default: str = "-") -> str:
+    """Render a manifest display field; strings pass through, other shapes render safely."""
+    if value is None or value == "":
+        return default
+    return value if isinstance(value, str) else format_jira_field(value)
 
 
 async def publish_validated_draft(update, session, jira_url, auth_headers, key, draft):
@@ -200,7 +215,7 @@ class ReviewScreen(Screen):
         self.jira_url = jira_url
         self.auth_headers = auth_headers
         self.date_dir = date_dir
-        self.prefs = prefs
+        self.prefs = prefs or UserPrefs()
         self.scripts_dir = scripts_dir
         self.args = args
         self.system_prompt = system_prompt
@@ -208,7 +223,8 @@ class ReviewScreen(Screen):
         self.results: dict[str, ReviewResult] = {}
         self._publication_tasks: dict[str, object] = {}
         self._aiohttp_session: Optional[aiohttp.ClientSession] = None
-        self._col_keys = None
+        self._col_keys = {}
+        self._field_generation: dict[str, int] = {}
         # Vim-style search state.
         self._search_matches: list[int] = []
         self._search_idx = 0
@@ -232,27 +248,100 @@ class ReviewScreen(Screen):
     def on_mount(self) -> None:
         table = self.query_one("#issue-table", DataTable)
         table.cursor_type = "row"
-        self._col_keys = table.add_columns("Key", "Summary", "Color", "Action")
+        self._col_keys = {
+            column.key: table.add_column(Text(column.label), key=column.key)
+            for column in self.prefs.resolved_columns
+        }
         for issue in self.issues:
             key = issue["key"]
             draft = self.drafts.get(key, "")
             color = extract_color(draft)
-            table.add_row(
-                key,
-                (issue.get("summary") or "")[:60],
-                color,
-                {
+            values = {
+                "key": key,
+                "summary": _manifest_text(issue.get("summary"), "")[:60],
+                "color": color,
+                "status": _manifest_text(issue.get("status")),
+                "assignee": _manifest_text(issue.get("assignee")),
+                "target_version": "…",
+                "action": {
                     "quiet_skip": "Quiet skip",
                     "missing_data": "No data",
                     "draft_failed": "Draft failed",
                     "invalid_draft": "Invalid draft",
                 }.get(self.outcomes.get(key), "-"),
+            }
+            table.add_row(
+                *(values.get(column.key, "…") for column in self.prefs.resolved_columns),
                 key=key,
             )
         if self.issues:
             table.move_cursor(row=0)
             self._update_panels()
         self._update_status_bar()
+        self.run_worker(self._load_jira_columns([issue["key"] for issue in self.issues]))
+
+    async def _load_jira_columns(self, keys: list[str]) -> None:
+        """Load display metadata without delaying review or LLM drafting."""
+        columns = [
+            column for column in self.prefs.resolved_columns
+            if column.field or column.key == "target_version"
+        ]
+        if not columns or not keys:
+            return
+        field_ids = []
+        for column in columns:
+            if column.field:
+                field_ids.append(column.field.split(".")[0])
+            else:
+                field_ids.extend((self.prefs.target_version_field, "fixVersions"))
+        field_ids = list(dict.fromkeys(field_ids))
+        generations = {}
+        for key in keys:
+            generations[key] = self._field_generation.get(key, 0) + 1
+            self._field_generation[key] = generations[key]
+            for column in columns:
+                # Placeholder writes never change width; only final values do.
+                self._update_cell(key, column.key, "…", update_width=False)
+        sem = asyncio.Semaphore(10)
+        failed = []
+        async with aiohttp.ClientSession() as session:
+            async def load(key):
+                async with sem:
+                    try:
+                        fields = await get_issue_fields(
+                            session, self.jira_url, self.auth_headers, key,
+                            field_ids,
+                        )
+                    except (aiohttp.ClientError, asyncio.TimeoutError):
+                        fields = None
+                    except Exception:
+                        # Unexpected shape errors are bugs, not outages: keep the
+                        # table usable but make them diagnosable in the log.
+                        logger.exception("Unexpected error loading Jira fields for %s", key)
+                        fields = None
+                    # A refresh may have started while this request was in flight;
+                    # its result, including a failure, must not overwrite or warn.
+                    if self._field_generation[key] != generations[key]:
+                        return
+                    if fields is None:
+                        failed.append(key)
+                    for column in columns:
+                        if fields is None:
+                            value = "Unavailable"
+                        else:
+                            raw = (
+                                jira_field_value(fields, column.field) if column.field else
+                                fields.get(self.prefs.target_version_field) or fields.get("fixVersions")
+                            )
+                            value = format_jira_field(raw)
+                        self._update_cell(key, column.key, Text(value))
+            await asyncio.gather(*(load(key) for key in keys))
+        if failed:
+            self.app.notify(
+                f"Could not load Jira columns for {len(failed)} issue(s). "
+                "Check Jira access and configured field references; r/R retries.",
+                severity="warning",
+            )
 
     def on_data_table_row_highlighted(self) -> None:
         self._update_panels()
@@ -341,9 +430,25 @@ class ReviewScreen(Screen):
         )
 
     def _mark_action(self, key: str, label: str) -> None:
-        table = self.query_one("#issue-table", DataTable)
-        table.update_cell(key, self._col_keys[3], label)
+        self._update_cell(key, "action", label)
         self._update_status_bar()
+
+    def _update_cell(self, key: str, column: str, value: str | Text, update_width: bool = True) -> None:
+        """Update a visible column; hidden columns do not affect review actions."""
+        if column in self._col_keys:
+            self.query_one("#issue-table", DataTable).update_cell(
+                key, self._col_keys[column], value, update_width=update_width,
+            )
+
+    def _update_issue_metadata(self, issues: list[dict]) -> None:
+        refreshed = {issue["key"]: issue for issue in issues}
+        for issue in self.issues:
+            key = issue["key"]
+            if key in refreshed:
+                issue.update(refreshed[key])
+                for column in ("summary", "status", "assignee"):
+                    value = _manifest_text(issue.get(column))
+                    self._update_cell(key, column, value[:60] if column == "summary" else value)
 
     def _advance(self) -> None:
         table = self.query_one("#issue-table", DataTable)
@@ -423,8 +528,8 @@ class ReviewScreen(Screen):
             return
         color, error = validate_draft(draft)
         if error:
-            self.query_one("#issue-table", DataTable).update_cell(key, self._col_keys[2], "Unknown")
-            self.query_one("#issue-table", DataTable).update_cell(key, self._col_keys[3], "Invalid draft")
+            self._update_cell(key, "color", "Unknown")
+            self._update_cell(key, "action", "Invalid draft")
             self.app.notify(error, title="Cannot publish", severity="error")
             return
         if result is None or result.action == "skipped":
@@ -479,9 +584,8 @@ class ReviewScreen(Screen):
             _, validation_error = validate_draft(edited)
             self.outcomes[key] = "invalid_draft" if validation_error else "drafted"
             self._save_drafts()
-            table = self.query_one("#issue-table", DataTable)
-            table.update_cell(key, self._col_keys[2], extract_color(edited))
-            table.update_cell(key, self._col_keys[3], "Invalid draft" if validation_error else "-")
+            self._update_cell(key, "color", extract_color(edited))
+            self._update_cell(key, "action", "Invalid draft" if validation_error else "-")
             self._update_draft_panel()
 
     def action_interactive_changes(self) -> None:
@@ -500,10 +604,10 @@ class ReviewScreen(Screen):
         self.run_worker(self._do_refresh(key), exclusive=False)
 
     async def _do_refresh(self, key: str) -> None:
+        self.run_worker(self._load_jira_columns([key]))
         draft_panel = self.query_one("#draft-panel", RichLog)
         draft_panel.loading = True
-        table = self.query_one("#issue-table", DataTable)
-        table.update_cell(key, self._col_keys[3], "Refreshing…")
+        self._update_cell(key, "action", "Refreshing…")
         try:
             date_dir, manifest = await run_gather(
                 self.scripts_dir, self.args,
@@ -512,10 +616,11 @@ class ReviewScreen(Screen):
             )
 
             self.date_dir = date_dir
+            self._update_issue_metadata(manifest["issues"])
             issue_file = self.date_dir / "issues" / f"{key}.json"
             if not issue_file.exists():
                 self.outcomes[key] = "missing_data"
-                table.update_cell(key, self._col_keys[3], "No data")
+                self._update_cell(key, "action", "No data")
                 self.app.notify(f"No data file for {key} after refresh", severity="error")
                 return
 
@@ -524,7 +629,7 @@ class ReviewScreen(Screen):
             summary = json.dumps(pruned, indent=2)
             self.summaries[key] = summary
 
-            table.update_cell(key, self._col_keys[3], "Drafting…")
+            self._update_cell(key, "action", "Drafting…")
             draft = await draft_ryg(
                 self.client, self.model, self.system_prompt, summary, self.usage,
             )
@@ -533,14 +638,14 @@ class ReviewScreen(Screen):
             self.outcomes[key] = "invalid_draft" if validation_error else "drafted"
             self._save_drafts()
             save_draft_input(self.date_dir, key, summary)
-            table.update_cell(key, self._col_keys[2], extract_color(draft))
-            table.update_cell(key, self._col_keys[3], "Invalid draft" if validation_error else "-")
+            self._update_cell(key, "color", extract_color(draft))
+            self._update_cell(key, "action", "Invalid draft" if validation_error else "-")
             self.results.pop(key, None)
             self._update_draft_panel()
             self.app.notify(f"{key} refreshed")
         except Exception as e:
             self.outcomes[key] = "draft_failed"
-            table.update_cell(key, self._col_keys[3], "Draft failed")
+            self._update_cell(key, "action", "Draft failed")
             self.app.notify(str(e), title="Refresh failed", severity="error")
         finally:
             draft_panel.loading = False
@@ -555,11 +660,11 @@ class ReviewScreen(Screen):
         self.run_worker(self._do_refresh_all(), exclusive=False)
 
     async def _do_refresh_all(self) -> None:
+        self.run_worker(self._load_jira_columns([issue["key"] for issue in self.issues]))
         draft_panel = self.query_one("#draft-panel", RichLog)
         draft_panel.loading = True
-        table = self.query_one("#issue-table", DataTable)
         for issue in self.issues:
-            table.update_cell(issue["key"], self._col_keys[3], "Refreshing…")
+            self._update_cell(issue["key"], "action", "Refreshing…")
         try:
             output_dir = getattr(self.args, "output_dir", ".work/weekly-status")
             date_dir, manifest = await run_gather(
@@ -567,8 +672,9 @@ class ReviewScreen(Screen):
                 refresh=True,
             )
             self.date_dir = date_dir
+            self._update_issue_metadata(manifest["issues"])
             for issue in self.issues:
-                table.update_cell(issue["key"], self._col_keys[3], "Drafting…")
+                self._update_cell(issue["key"], "action", "Drafting…")
 
             if self.date_dir:
                 drafts_path = _drafts_path(self.date_dir)
@@ -603,8 +709,8 @@ class ReviewScreen(Screen):
             for issue in self.issues:
                 key = issue["key"]
                 draft = self.drafts.get(key, "")
-                table.update_cell(key, self._col_keys[2], extract_color(draft))
-                table.update_cell(key, self._col_keys[3], {
+                self._update_cell(key, "color", extract_color(draft))
+                self._update_cell(key, "action", {
                     "quiet_skip": "Quiet skip",
                     "missing_data": "No data",
                     "draft_failed": "Draft failed",
@@ -647,9 +753,8 @@ class ReviewScreen(Screen):
                 _, validation_error = validate_draft(revised)
                 self.outcomes[key] = "invalid_draft" if validation_error else "drafted"
                 self._save_drafts()
-                table = self.query_one("#issue-table", DataTable)
-                table.update_cell(key, self._col_keys[2], extract_color(revised))
-                table.update_cell(key, self._col_keys[3], "Invalid draft" if validation_error else "-")
+                self._update_cell(key, "color", extract_color(revised))
+                self._update_cell(key, "action", "Invalid draft" if validation_error else "-")
                 self._update_draft_panel()
             except Exception as e:
                 self.app.notify(str(e), title="Revision failed", severity="error")
@@ -668,9 +773,8 @@ class ReviewScreen(Screen):
             _, validation_error = validate_draft(revised)
             self.outcomes[key] = "invalid_draft" if validation_error else "drafted"
             self._save_drafts()
-            table = self.query_one("#issue-table", DataTable)
-            table.update_cell(key, self._col_keys[2], extract_color(revised))
-            table.update_cell(key, self._col_keys[3], "Invalid draft" if validation_error else "-")
+            self._update_cell(key, "color", extract_color(revised))
+            self._update_cell(key, "action", "Invalid draft" if validation_error else "-")
             self._update_draft_panel()
         except Exception as e:
             self.app.notify(str(e), title="Revision failed", severity="error")
