@@ -34,15 +34,22 @@ add credential values to the model prompt.
 
 ## Temporal evidence contract
 
-The gatherer manifest is the authority for the resolved reporting interval and
-must provide:
+The gatherer manifest is the authority for the resolved reporting interval.
+A valid recorded `reporting_window` (offset-aware `start`, `end_exclusive`,
+IANA `timezone`) is used as-is; otherwise Herald derives one from the
+gatherer's date-only `config.date_range` as midnight-UTC half-open bounds
+(`timezone` `"UTC"`) and writes it back into the persisted manifest. The
+resolved manifest provides:
 
 ```json
 {
+  "config": {
+    "date_range": {"start": "2026-10-08", "end": "2026-10-14"}
+  },
   "reporting_window": {
-    "start": "2026-10-07T22:00:00Z",
-    "end_exclusive": "2026-10-14T22:00:00Z",
-    "timezone": "Europe/Prague"
+    "start": "2026-10-08T00:00:00+00:00",
+    "end_exclusive": "2026-10-15T00:00:00+00:00",
+    "timezone": "UTC"
   },
   "gathered_at": "2026-10-14T12:34:56Z",
   "issue_gathered_at": {"DEMO-42": "2026-10-14T12:34:56Z"}
@@ -112,7 +119,7 @@ member, falling back to the whole object when that member is absent.
 | `summary` | `issue.summary` (the issue title, not its full description) |
 | `status` | `issue.status`, forwarded as provided |
 | `assignee` | `issue.assignee.name` for an object; otherwise the provided value; missing/empty becomes `"?"` |
-| `reporting_window` | Resolved manifest window, with `status: known` only for valid offset-aware start/end and IANA timezone; otherwise values are null and status is `unknown` |
+| `reporting_window` | Resolved manifest window — recorded if valid, else derived by Herald from the gatherer's date-only `config.date_range` as midnight-UTC half-open bounds; `status: known` only for valid offset-aware start/end and IANA timezone, otherwise values are null and status is `unknown` |
 | `gathered_at` / `gather_freshness` | Valid per-issue timestamp from `issue_gathered_at`, otherwise a valid full-gather timestamp when no per-issue map exists; legacy or invalid values become null / `unknown` |
 | `events_in_window[]` | Gatherer events with valid timestamps inside the half-open window; legacy dated Jira comments/transitions are adapted here |
 | `undated_activity[]` | Gatherer coverage gaps plus legacy Jira comments/transitions without an event timestamp |
@@ -141,9 +148,9 @@ contents depend on the external gatherer.
   "status": "In Progress",
   "assignee": "Example Lead",
   "reporting_window": {
-    "start": "2026-10-07T22:00:00Z",
-    "end_exclusive": "2026-10-14T22:00:00Z",
-    "timezone": "Europe/Prague",
+    "start": "2026-10-08T00:00:00+00:00",
+    "end_exclusive": "2026-10-15T00:00:00+00:00",
+    "timezone": "UTC",
     "status": "known"
   },
   "gathered_at": "2026-10-14T12:34:56Z",

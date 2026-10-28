@@ -7,18 +7,21 @@ import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from herald.app import ReviewResult, ReviewScreen, edit_in_editor, extract_color, publish_validated_draft
 from herald.config import UserPrefs, find_scripts_dir, find_skills_dir, load_prefs
 from herald.gather import (
+    _ensure_reporting_window,
     _field_to_text,
     _prune_issue,
+    _window_is_valid,
+    batch_draft,
     is_significant,
     load_current_statuses,
-    batch_draft,
+    run_gather,
 )
 from herald.jira import _normalized_adf, get_jira_auth, update_jira_status
 from herald.llm import TokenUsage, build_system_prompt
@@ -607,20 +610,93 @@ def test_prune_issue_pr_drops_raw_arrays():
     assert "sha" not in str(pruned)
 
 
+# ─── Reporting window resolution ─────────────────────────────────────────────
+
+def _gatherer_manifest(start="2026-08-01", end="2026-08-07"):
+    """Manifest in the shape run_gather emits: window derived from date_range."""
+    manifest = {
+        "config": {"date_range": {"start": start, "end": end}},
+        "issue_gathered_at": {"ISSUE-1": "2026-08-08T00:05:00Z"},
+    }
+    _ensure_reporting_window(manifest)
+    return manifest
+
+
+def test_ensure_reporting_window_derives_half_open_utc_bounds():
+    manifest = {"config": {"date_range": {"start": "2026-10-21", "end": "2026-10-28"}}}
+    window = _ensure_reporting_window(manifest)
+    assert window == {
+        "start": "2026-10-21T00:00:00+00:00",
+        "end_exclusive": "2026-10-29T00:00:00+00:00",
+        "timezone": "UTC",
+    }
+    assert manifest["reporting_window"] is window
+
+
+def test_ensure_reporting_window_prefers_recorded_window():
+    recorded = {
+        "start": "2026-10-01T00:00:00+02:00",
+        "end_exclusive": "2026-10-08T00:00:00+02:00",
+        "timezone": "Europe/Prague",
+    }
+    manifest = {
+        "reporting_window": dict(recorded),
+        "config": {"date_range": {"start": "2026-10-21", "end": "2026-10-28"}},
+    }
+    assert _ensure_reporting_window(manifest) == recorded
+
+
+def test_ensure_reporting_window_unresolvable_manifests():
+    for manifest in (
+        {},
+        {"config": {}},
+        {"config": {"date_range": {}}},
+        {"config": {"date_range": {"start": "not-a-date", "end": "2026-10-28"}}},
+        {"config": {"date_range": {"start": "2026-10-28", "end": "2026-10-21"}}},
+    ):
+        assert _ensure_reporting_window(manifest) is None
+        assert "reporting_window" not in manifest
+
+
+def test_window_is_valid_rejects_malformed_windows():
+    assert _window_is_valid(None) is False
+    assert _window_is_valid({"start": "2026-10-21", "end_exclusive": "2026-10-28"}) is False
+    assert _window_is_valid({
+        "start": "2026-10-21T00:00:00+00:00",
+        "end_exclusive": "2026-10-20T00:00:00+00:00",
+        "timezone": "UTC",
+    }) is False
+
+
+def test_prune_issue_classifies_events_with_derived_window():
+    manifest = _gatherer_manifest("2026-10-21", "2026-10-28")
+    data = _make_issue_data(events_in_window=[
+        {"type": "jira_comment", "occurred_at": "2026-10-26T19:11:43+00:00"},
+        {"type": "jira_comment", "occurred_at": "2026-10-21T00:00:00Z"},
+        {"type": "jira_comment", "occurred_at": "2026-10-20T23:59:59Z"},
+        {"type": "jira_comment", "occurred_at": "2026-10-29T00:00:00Z"},
+    ])
+
+    pruned = _prune_issue(data, manifest)
+
+    assert pruned["reporting_window"]["status"] == "known"
+    assert [e["occurred_at"] for e in pruned["events_in_window"]] == [
+        "2026-10-26T19:11:43+00:00",
+        "2026-10-21T00:00:00Z",
+    ]
+    assert [e["occurred_at"] for e in pruned["carry_forward_context"]["older_activity"]] == [
+        "2026-10-20T23:59:59Z",
+        "2026-10-29T00:00:00Z",
+    ]
+
+
 def test_prune_issue_classifies_events_using_half_open_window():
     data = _make_issue_data(events_in_window=[
         {"type": "pr_review", "occurred_at": "2026-08-01T00:00:00Z", "text": "reviewed"},
         {"type": "pr_commit", "occurred_at": "2026-08-08T00:00:00Z", "text": "boundary"},
         {"type": "jira_comment", "text": "missing timestamp"},
     ])
-    manifest = {
-        "reporting_window": {
-            "start": "2026-08-01T00:00:00Z",
-            "end_exclusive": "2026-08-08T00:00:00Z",
-            "timezone": "Europe/Prague",
-        },
-        "issue_gathered_at": {"ISSUE-1": "2026-08-08T00:05:00Z"},
-    }
+    manifest = _gatherer_manifest("2026-08-01", "2026-08-07")
 
     pruned = _prune_issue(data, manifest)
 
@@ -645,14 +721,7 @@ def test_prune_issue_keeps_recent_review_separate_from_old_merge():
         "state": "MERGED",
         "merged_at": "2026-07-15T12:00:00Z",
     }]
-    manifest = {
-        "reporting_window": {
-            "start": "2026-08-01T00:00:00Z",
-            "end_exclusive": "2026-08-08T00:00:00Z",
-            "timezone": "Europe/Prague",
-        },
-        "issue_gathered_at": {"ISSUE-1": "2026-08-08T00:05:00Z"},
-    }
+    manifest = _gatherer_manifest("2026-08-01", "2026-08-07")
 
     pruned = _prune_issue(data, manifest)
 
@@ -788,3 +857,105 @@ def test_profile_does_not_override_explicitly_set_args():
     assert args.component == "My Component"
     assert args.label == "my-label"
     assert args.model == "claude-haiku-4-5"  # profile fills model (was None)
+
+
+# ─── run_gather window derivation ────────────────────────────────────────────
+
+class _FakeGatherProc:
+    returncode = 0
+
+    def __init__(self, stdout_bytes):
+        self._stdout_bytes = stdout_bytes
+        self.stdout = self
+        self.stderr = self
+
+    async def read(self):
+        return self._stdout_bytes
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        raise StopAsyncIteration
+
+    async def wait(self):
+        return 0
+
+
+def test_run_gather_derives_and_persists_reporting_window(tmp_path):
+    subprocess_manifest = {
+        "config": {"date_range": {"start": "2026-10-21", "end": "2026-10-28"}},
+        "issues": [],
+    }
+    proc = _FakeGatherProc(json.dumps(subprocess_manifest).encode())
+    args = SimpleNamespace(
+        project="OCPSTRAT", component=None, label=None,
+        assignee=[], exclude=[], days=None, start_date=None, end_date=None,
+    )
+
+    with patch("herald.gather._find_cached_gather", return_value=None), \
+         patch("herald.gather._save_cache_meta"), \
+         patch("herald.gather.asyncio.create_subprocess_exec",
+               new_callable=AsyncMock, return_value=proc):
+        date_dir, result = asyncio.run(
+            run_gather(Path("/tmp"), args, output_dir=str(tmp_path))
+        )
+
+    assert result["reporting_window"] == {
+        "start": "2026-10-21T00:00:00+00:00",
+        "end_exclusive": "2026-10-29T00:00:00+00:00",
+        "timezone": "UTC",
+    }
+    persisted = json.loads((tmp_path / "2026-10-28" / "manifest.json").read_text())
+    assert persisted["reporting_window"] == result["reporting_window"]
+
+
+def test_run_gather_cached_manifest_gets_derived_window(tmp_path):
+    date_dir = tmp_path / "2026-10-28"
+    date_dir.mkdir()
+    manifest = {
+        "config": {"date_range": {"start": "2026-10-21", "end": "2026-10-28"}},
+        "issues": [],
+    }
+    (date_dir / "manifest.json").write_text(json.dumps(manifest))
+    args = SimpleNamespace(project="OCPSTRAT")
+
+    with patch("herald.gather._find_cached_gather", return_value=(date_dir, manifest)):
+        result_dir, result = asyncio.run(
+            run_gather(Path("/tmp"), args, output_dir=str(tmp_path))
+        )
+
+    assert result_dir == date_dir
+    assert result["reporting_window"]["end_exclusive"] == "2026-10-29T00:00:00+00:00"
+    persisted = json.loads((date_dir / "manifest.json").read_text())
+    assert persisted["reporting_window"] == result["reporting_window"]
+
+
+def test_run_gather_warns_when_window_unresolvable(tmp_path):
+    # Reversed range parses but derives no window; date_range.end must still
+    # exist because run_gather builds the date directory from it.
+    subprocess_manifest = {
+        "config": {"date_range": {"start": "2026-10-28", "end": "2026-10-21"}},
+        "issues": [],
+    }
+    proc = _FakeGatherProc(json.dumps(subprocess_manifest).encode())
+    args = SimpleNamespace(
+        project="OCPSTRAT", component=None, label=None,
+        assignee=[], exclude=[], days=None, start_date=None, end_date=None,
+    )
+    warnings = []
+
+    async def callback(line):
+        warnings.append(line)
+
+    with patch("herald.gather._find_cached_gather", return_value=None), \
+         patch("herald.gather._save_cache_meta"), \
+         patch("herald.gather.asyncio.create_subprocess_exec",
+               new_callable=AsyncMock, return_value=proc):
+        _, result = asyncio.run(
+            run_gather(Path("/tmp"), args, output_dir=str(tmp_path),
+                       line_callback=callback)
+        )
+
+    assert "reporting_window" not in result
+    assert any("reporting window unresolved" in line for line in warnings)
