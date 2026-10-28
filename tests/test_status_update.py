@@ -633,6 +633,62 @@ def test_ensure_reporting_window_derives_half_open_utc_bounds():
     assert manifest["reporting_window"] is window
 
 
+def test_derived_window_round_trips_through_validation():
+    # A window persisted by run_gather must be accepted as-is on the next
+    # cached read, so the cached path does not re-derive every run.
+    manifest = {"config": {"date_range": {"start": "2026-10-21", "end": "2026-10-28"}}}
+    window = _ensure_reporting_window(manifest)
+    assert _window_is_valid(window) is True
+    assert _ensure_reporting_window(manifest) is window
+
+
+_FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def test_window_resolution_gatherer_manifest_fixture():
+    # Shape exactly as gather_status_data.py writes it: date-only
+    # config.date_range, no reporting_window key.
+    manifest = json.loads((_FIXTURES / "gatherer_manifest.json").read_text())
+
+    window = _ensure_reporting_window(manifest)
+
+    assert _window_is_valid(window) is True
+    assert window == {
+        "start": "2026-10-21T00:00:00+00:00",
+        "end_exclusive": "2026-10-29T00:00:00+00:00",
+        "timezone": "UTC",
+    }
+    assert manifest["reporting_window"] is window
+
+
+def test_window_resolution_prefers_persisted_window_fixture():
+    # Shape as run_gather persists it after derivation: the recorded window
+    # must win over re-derivation from date_range.
+    manifest = json.loads(
+        (_FIXTURES / "manifest_with_recorded_window.json").read_text()
+    )
+    recorded = manifest["reporting_window"]
+
+    window = _ensure_reporting_window(manifest)
+
+    assert window is recorded
+    assert _window_is_valid(window) is True
+
+
+def test_window_resolution_single_day_range_fixture():
+    # A range where start == end covers exactly one calendar day; the
+    # half-open bounds must still form a valid non-empty interval.
+    manifest = json.loads(
+        (_FIXTURES / "manifest_single_day_range.json").read_text()
+    )
+
+    window = _ensure_reporting_window(manifest)
+
+    assert _window_is_valid(window) is True
+    assert window["start"] == "2026-10-28T00:00:00+00:00"
+    assert window["end_exclusive"] == "2026-10-29T00:00:00+00:00"
+
+
 def test_ensure_reporting_window_prefers_recorded_window():
     recorded = {
         "start": "2026-10-01T00:00:00+02:00",
