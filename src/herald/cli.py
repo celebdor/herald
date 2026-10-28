@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import re
 from pathlib import Path
 
 import aiohttp
@@ -9,6 +10,9 @@ import aiohttp
 from .app import StatusUpdateApp
 from .config import find_scripts_dir, load_prefs
 from .fields import show_fields
+
+# Jira issue keys are a project key plus a number, e.g. OCPBUGS-42.
+_ISSUE_KEY_RE = re.compile(r"[A-Za-z][A-Za-z0-9]+-\d+")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -67,6 +71,8 @@ async def main() -> None:
     args = parser.parse_args()
     if args.command is None and not args.project:
         parser.error("--project is required for reporting")
+    if args.command == "fields" and args.issue and not _ISSUE_KEY_RE.fullmatch(args.issue):
+        parser.error(f"--issue must be a Jira issue key like OCPSTRAT-2666, not {args.issue!r}")
     try:
         prefs = load_prefs(args.prefs)
     except (ValueError, OSError) as exc:

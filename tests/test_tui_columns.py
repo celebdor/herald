@@ -1,15 +1,17 @@
 """Preferences and headless review tests; no network or credentials required."""
 
 import asyncio
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
+import aiohttp
 import pytest
 from textual.app import App
 from textual.widgets import DataTable
 
 from herald.app import ReviewScreen
 from herald.config import DEFAULT_COLUMNS, UserPrefs, load_prefs
-from herald.jira import format_jira_field, get_issue_fields, jira_field_value
+from herald.jira import _issue_url, format_jira_field, get_issue_fields, jira_field_value
 from herald.llm import TokenUsage
 
 
@@ -38,12 +40,34 @@ def test_invalid_columns(tmp_path, value):
         load_prefs(path)
 
 
-@pytest.mark.parametrize("value", ['""', 'false', '[]'])
+@pytest.mark.parametrize("value", [
+    '""', '" "', 'false', '[]', '123',
+    '"Target Version"',  # Display name, not a field ID.
+    '"*all"',            # Would request every field.
+    '"priority.name"',   # Dotted paths are not supported for this value.
+])
 def test_invalid_version_field(tmp_path, value):
     path = tmp_path / "prefs.toml"
     path.write_text(f"[jira]\ntarget_version_field = {value}")
     with pytest.raises(ValueError, match="target_version_field"):
         load_prefs(path)
+
+
+def test_version_field_is_stripped(tmp_path):
+    path = tmp_path / "prefs.toml"
+    path.write_text('[jira]\ntarget_version_field = " fixVersions "')
+    assert load_prefs(path).target_version_field == "fixVersions"
+
+
+@pytest.mark.parametrize(("key", "path"), [
+    ("ABC-1", "/rest/api/3/issue/ABC-1"),
+    ("../search", "/rest/api/3/issue/..%2Fsearch"),          # No dot-segment resolution.
+    ("ABC-1?fields=*all", "/rest/api/3/issue/ABC-1%3Ffields%3D%2Aall"),  # No query injection.
+    ("ABC%31", "/rest/api/3/issue/ABC%2531"),                 # No percent decoding.
+    ("ABC-2#comment", "/rest/api/3/issue/ABC-2%23comment"),   # No fragment truncation.
+])
+def test_issue_url_keeps_key_in_one_segment(key, path):
+    assert _issue_url("https://jira/", key) == "https://jira" + path
 
 
 @pytest.mark.parametrize(("fields", "expected"), [
@@ -145,7 +169,7 @@ def test_review_actions_with_configured_columns(monkeypatch, columns):
 
 
 def test_version_lookup_failure_is_visible_and_recoverable(monkeypatch):
-    lookup = AsyncMock(side_effect=RuntimeError("offline"))
+    lookup = AsyncMock(side_effect=aiohttp.ClientError("offline"))
     monkeypatch.setattr("herald.app.get_issue_fields", lookup)
 
     async def run():
@@ -161,6 +185,83 @@ def test_version_lookup_failure_is_visible_and_recoverable(monkeypatch):
             assert str(table.get_cell("ABC-1", "target_version")) == "4.23"
             review.action_skip()
             assert review.results["ABC-1"].action == "skipped"
+    asyncio.run(run())
+
+
+def test_unexpected_field_error_is_logged_and_degrades(monkeypatch, caplog):
+    """A bug (not an outage) still shows Unavailable, but leaves a traceback."""
+    lookup = AsyncMock(side_effect=KeyError("fields"))
+    monkeypatch.setattr("herald.app.get_issue_fields", lookup)
+
+    async def run():
+        review = make_review(["target_version"])
+        async with ReviewApp(review).run_test():
+            await review.workers.wait_for_complete()
+            table = review.query_one(DataTable)
+            assert str(table.get_cell("ABC-1", "target_version")) == "Unavailable"
+
+    with caplog.at_level(logging.ERROR, logger="herald.app"):
+        asyncio.run(run())
+    assert "Unexpected error loading Jira fields for ABC-1" in caplog.text
+    assert any(record.exc_info for record in caplog.records)
+
+
+def test_manifest_display_fields_render_structured_values():
+    """A gatherer emitting structured summary/status/assignee must not crash the table."""
+    review = ReviewScreen(
+        [{"key": "ABC-1", "summary": {"text": "ignored"}, "status": ["Done"],
+          "assignee": {"displayName": "alice"}}],
+        {"ABC-1": "* Color Status: Green\nWork is progressing."},
+        {}, {}, None, "model", TokenUsage(), "https://jira", {},
+        prefs=UserPrefs(columns=["key", "summary", "status", "assignee", "color", "action"]),
+    )
+
+    async def run():
+        async with ReviewApp(review).run_test():
+            await review.workers.wait_for_complete()
+            table = review.query_one(DataTable)
+            assert str(table.get_cell("ABC-1", "summary")).startswith('{"text"')
+            assert str(table.get_cell("ABC-1", "status")) == "Done"
+            assert table.get_cell("ABC-1", "assignee") == "alice"
+    asyncio.run(run())
+
+
+def test_superseded_load_does_not_warn_or_overwrite(monkeypatch):
+    """An in-flight load must not overwrite or warn after a newer load starts."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def lookup(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 3:  # The superseded request: delayed, then fails late.
+            started.set()
+            await release.wait()
+            raise RuntimeError("late failure")
+        return {"priority": {"name": "Second" if calls == 4 else "Mount"}}
+
+    monkeypatch.setattr("herald.app.get_issue_fields", lookup)
+    notify = MagicMock()
+    monkeypatch.setattr(ReviewApp, "notify", notify)
+
+    async def run():
+        review = make_review([{"field": "priority.name", "label": "Priority"}])
+        async with ReviewApp(review).run_test():
+            await review.workers.wait_for_complete()  # Initial on-mount load.
+            table = review.query_one(DataTable)
+            column = "jira:priority.name"
+            assert str(table.get_cell("ABC-1", column)) == "Mount"
+            first = asyncio.create_task(review._load_jira_columns(["ABC-1"]))
+            await started.wait()
+            second = asyncio.create_task(review._load_jira_columns(["ABC-1"]))
+            await second
+            assert str(table.get_cell("ABC-1", column)) == "Second"
+            release.set()
+            await first
+            assert str(table.get_cell("ABC-1", column)) == "Second"
+            assert calls == 4  # One request per issue on mount, then the overlapping pair.
+            notify.assert_not_called()
     asyncio.run(run())
 
 
@@ -285,12 +386,14 @@ def test_custom_columns_share_requests_and_refresh(monkeypatch, with_target):
             assert str(table.get_cell("ABC-1", "jira:priority.name")) == "High"
             assert str(table.get_cell("ABC-1", "jira:priority.id")) == "1"
             assert str(table.get_cell("ABC-1", "jira:components.name")) == "API, Networking"
+            # Placeholders skip width recalculation; final values must still fit.
+            assert table.columns["jira:components.name"].width >= len("API, Networking")
             assert str(table.get_cell("ABC-1", "jira:customfield_12345")) == "-"
             assert table.get_cell("ABC-1", "jira:labels").plain == "[red]literal[/red]"
             if with_target:
                 assert str(table.get_cell("ABC-1", "target_version")) == "4.22"
                 assert str(table.get_cell("ABC-1", "jira:customfield_10855")) == "4.22"
-            lookup.side_effect = RuntimeError("offline")
+            lookup.side_effect = aiohttp.ClientError("offline")
             await review._load_jira_columns(["ABC-1"])
             assert str(table.get_cell("ABC-1", "jira:priority.name")) == "Unavailable"
             review.action_skip()

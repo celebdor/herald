@@ -79,6 +79,10 @@ async def show_fields(args, prefs) -> None:
     else:
         console.print(Text("Add --issue ISSUE-123 to inspect values or search for a known value."))
     if len(matches) == 1:
-        console.print(Text("Add this entry to [tui] columns in prefs.toml:\n" + column_entry(matches[0])))
+        # soft_wrap keeps the TOML entry on one line so it can be copied whole.
+        console.print(
+            Text("Add this entry to [tui] columns in prefs.toml:\n" + column_entry(matches[0])),
+            soft_wrap=True,
+        )
     else:
         console.print(Text("Search an exact field ID to get a column entry for prefs.toml."))

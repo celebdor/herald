@@ -124,6 +124,14 @@ def test_reporting_still_requires_project(monkeypatch, capsys):
     assert "--project is required" in capsys.readouterr().err
 
 
+def test_fields_rejects_invalid_issue_key(monkeypatch, capsys):
+    monkeypatch.setattr("sys.argv", ["herald", "fields", "version", "--issue", "ABC-1?fields=*all"])
+    with pytest.raises(SystemExit) as exc:
+        asyncio.run(cli.main())
+    assert exc.value.code == 2
+    assert "--issue must be a Jira issue key" in capsys.readouterr().err
+
+
 def test_reporting_command_unchanged(monkeypatch):
     monkeypatch.setattr("sys.argv", ["herald", "--project", "ABC"])
     monkeypatch.setattr(cli, "load_prefs", lambda _: UserPrefs())

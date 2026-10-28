@@ -80,7 +80,12 @@ concern.
 Herald consumes JSON manifest output from stdout and streams stderr to the
 pipeline log. A nonzero exit becomes a gather failure. It expects
 `manifest.config.date_range.end` and `manifest.issues` with issue keys; it
-constructs the artifact directory as `<output-dir>/<end-date>`.
+constructs the artifact directory as `<output-dir>/<end-date>`. Issue entries
+may also carry optional `summary`, `status`, and `assignee` display fields,
+which the review table's built-in columns show directly; missing values fall
+back to `-`. These are expected as strings — structured values are rendered
+best-effort rather than trusted — and, like the Jira-sourced columns, are
+display-only: they never reach the LLM prompt.
 
 | Artifact | Writer | Consumers |
 | --- | --- | --- |

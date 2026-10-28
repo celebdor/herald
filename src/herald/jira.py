@@ -5,9 +5,15 @@ import json
 import os
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import quote
 
 import aiohttp
 import pyadf
+
+
+def _issue_url(jira_url: str, issue_key: str) -> str:
+    """Build an issue API URL; the quoted key stays a single path segment."""
+    return f"{jira_url.rstrip('/')}/rest/api/3/issue/{quote(issue_key, safe='')}"
 
 
 def _text_to_adf(text: str) -> dict:
@@ -64,7 +70,7 @@ async def get_issue_fields(
 ) -> dict:
     """Read all requested display fields in one request per issue."""
     async with session.get(
-        f"{jira_url.rstrip('/')}/rest/api/3/issue/{issue_key}",
+        _issue_url(jira_url, issue_key),
         params={"fields": ",".join(dict.fromkeys(field_ids))},
         headers=auth_headers,
         timeout=aiohttp.ClientTimeout(total=30),
@@ -121,7 +127,7 @@ async def update_jira_status(
 
     After a successful PUT, reads the field back to verify it actually changed.
     """
-    url = f"{jira_url}/rest/api/3/issue/{issue_key}"
+    url = _issue_url(jira_url, issue_key)
     payload = {"fields": {"customfield_10814": _text_to_adf(status_text)}}
     try:
         async with session.put(url, json=payload, headers=auth_headers) as resp:
@@ -144,9 +150,11 @@ async def update_jira_status(
             "unconfirmed",
         )
 
-    verify_url = f"{jira_url}/rest/api/3/issue/{issue_key}?fields=customfield_10814"
+    verify_url = _issue_url(jira_url, issue_key)
     try:
-        async with session.get(verify_url, headers=auth_headers) as resp:
+        async with session.get(
+            verify_url, headers=auth_headers, params={"fields": "customfield_10814"},
+        ) as resp:
             if resp.status not in (200, 204):
                 return JiraUpdateResult(
                     False,

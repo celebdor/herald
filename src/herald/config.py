@@ -28,6 +28,10 @@ TABLE_COLUMNS = {
 }
 DEFAULT_COLUMNS = ("key", "summary", "target_version", "color", "action")
 
+_FIELD_ID = r"[A-Za-z_][A-Za-z0-9_]*"
+_FIELD_ID_RE = re.compile(_FIELD_ID)
+_FIELD_REFERENCE_RE = re.compile(rf"{_FIELD_ID}(?:\.{_FIELD_ID})*")
+
 
 @dataclass(frozen=True)
 class ReviewColumn:
@@ -46,9 +50,7 @@ def resolve_columns(columns) -> list[ReviewColumn]:
             resolved.append(ReviewColumn(column, TABLE_COLUMNS[column]))
         elif isinstance(column, dict) and set(column) <= {"field", "label"}:
             reference = column.get("field")
-            if not isinstance(reference, str) or not re.fullmatch(
-                r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*", reference,
-            ):
+            if not isinstance(reference, str) or not _FIELD_REFERENCE_RE.fullmatch(reference):
                 raise ValueError("[tui] columns field must be a Jira field ID or dotted field path")
             label = column.get("label", reference)
             if not isinstance(label, str) or not label.strip():
@@ -78,8 +80,13 @@ class UserPrefs:
 
     def __post_init__(self) -> None:
         self.resolved_columns = resolve_columns(self.columns)
-        if not isinstance(self.target_version_field, str) or not self.target_version_field.strip():
-            raise ValueError("[jira] target_version_field must be a non-empty field ID")
+        # Read as a literal fields object key, so a plain field ID is required.
+        field_id = self.target_version_field.strip() if isinstance(
+            self.target_version_field, str
+        ) else self.target_version_field
+        if not isinstance(field_id, str) or not _FIELD_ID_RE.fullmatch(field_id):
+            raise ValueError("[jira] target_version_field must be a Jira field ID")
+        self.target_version_field = field_id
 
 
 def load_prefs(path: Optional[Path] = None) -> UserPrefs:

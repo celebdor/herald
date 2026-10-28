@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import os
 import subprocess
 import tempfile
@@ -43,10 +44,20 @@ from .llm import (
 )
 from .validation import validate_draft
 
+logger = logging.getLogger(__name__)
+
+
 def extract_color(draft: str) -> str:
     """Extract an unambiguous R/Y/G color, otherwise report Unknown."""
     color, _ = validate_draft(draft)
     return color or "Unknown"
+
+
+def _manifest_text(value, default: str = "-") -> str:
+    """Render a manifest display field; strings pass through, other shapes render safely."""
+    if value is None or value == "":
+        return default
+    return value if isinstance(value, str) else format_jira_field(value)
 
 
 async def publish_validated_draft(update, session, jira_url, auth_headers, key, draft):
@@ -247,10 +258,10 @@ class ReviewScreen(Screen):
             color = extract_color(draft)
             values = {
                 "key": key,
-                "summary": (issue.get("summary") or "")[:60],
+                "summary": _manifest_text(issue.get("summary"), "")[:60],
                 "color": color,
-                "status": issue.get("status") or "-",
-                "assignee": issue.get("assignee") or "-",
+                "status": _manifest_text(issue.get("status")),
+                "assignee": _manifest_text(issue.get("assignee")),
                 "target_version": "…",
                 "action": {
                     "quiet_skip": "Quiet skip",
@@ -289,7 +300,8 @@ class ReviewScreen(Screen):
             generations[key] = self._field_generation.get(key, 0) + 1
             self._field_generation[key] = generations[key]
             for column in columns:
-                self._update_cell(key, column.key, "…")
+                # Placeholder writes never change width; only final values do.
+                self._update_cell(key, column.key, "…", update_width=False)
         sem = asyncio.Semaphore(10)
         failed = []
         async with aiohttp.ClientSession() as session:
@@ -300,21 +312,29 @@ class ReviewScreen(Screen):
                             session, self.jira_url, self.auth_headers, key,
                             field_ids,
                         )
-                    except Exception:
+                    except (aiohttp.ClientError, asyncio.TimeoutError):
                         fields = None
+                    except Exception:
+                        # Unexpected shape errors are bugs, not outages: keep the
+                        # table usable but make them diagnosable in the log.
+                        logger.exception("Unexpected error loading Jira fields for %s", key)
+                        fields = None
+                    # A refresh may have started while this request was in flight;
+                    # its result, including a failure, must not overwrite or warn.
+                    if self._field_generation[key] != generations[key]:
+                        return
+                    if fields is None:
                         failed.append(key)
-                    # A refresh may have started while this request was in flight.
-                    if self._field_generation[key] == generations[key]:
-                        for column in columns:
-                            if fields is None:
-                                value = "Unavailable"
-                            else:
-                                raw = (
-                                    jira_field_value(fields, column.field) if column.field else
-                                    fields.get(self.prefs.target_version_field) or fields.get("fixVersions")
-                                )
-                                value = format_jira_field(raw)
-                            self._update_cell(key, column.key, Text(value))
+                    for column in columns:
+                        if fields is None:
+                            value = "Unavailable"
+                        else:
+                            raw = (
+                                jira_field_value(fields, column.field) if column.field else
+                                fields.get(self.prefs.target_version_field) or fields.get("fixVersions")
+                            )
+                            value = format_jira_field(raw)
+                        self._update_cell(key, column.key, Text(value))
             await asyncio.gather(*(load(key) for key in keys))
         if failed:
             self.app.notify(
@@ -413,11 +433,11 @@ class ReviewScreen(Screen):
         self._update_cell(key, "action", label)
         self._update_status_bar()
 
-    def _update_cell(self, key: str, column: str, value: str | Text) -> None:
+    def _update_cell(self, key: str, column: str, value: str | Text, update_width: bool = True) -> None:
         """Update a visible column; hidden columns do not affect review actions."""
         if column in self._col_keys:
             self.query_one("#issue-table", DataTable).update_cell(
-                key, self._col_keys[column], value, update_width=True,
+                key, self._col_keys[column], value, update_width=update_width,
             )
 
     def _update_issue_metadata(self, issues: list[dict]) -> None:
@@ -427,7 +447,7 @@ class ReviewScreen(Screen):
             if key in refreshed:
                 issue.update(refreshed[key])
                 for column in ("summary", "status", "assignee"):
-                    value = issue.get(column) or "-"
+                    value = _manifest_text(issue.get(column))
                     self._update_cell(key, column, value[:60] if column == "summary" else value)
 
     def _advance(self) -> None:
