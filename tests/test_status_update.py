@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import base64
+import io
 import json
 import os
 from pathlib import Path
@@ -10,6 +11,10 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.text import Text
+from textual.app import App
 
 from herald.app import (
     ReviewResult,
@@ -525,6 +530,132 @@ def test_quit_waits_for_pending_publication():
     asyncio.run(run_quit())
     assert review.dismissed == [result]
     assert result.publication_state == "published"
+
+
+# ─── _update_panels markdown rendering ───────────────────────────────────────
+
+class _RecordingPanel:
+    """Stand-in for a RichLog panel that records write() calls."""
+
+    def __init__(self):
+        self.writes = []
+
+    def clear(self):
+        self.writes.clear()
+
+    def write(self, item):
+        self.writes.append(item)
+
+    def scroll_home(self, animate=False):
+        pass
+
+
+def _panels_review():
+    review = SimpleNamespace(
+        drafts={"ABC-1": "Worked on [owner/repo#1](https://example.com/pull/1)."},
+        current_statuses={"ABC-1": "Fixed in [owner/repo#2](https://example.com/pull/2)."},
+        results={},
+        _current_key=lambda: "ABC-1",
+    )
+    panels = {"#draft-panel": _RecordingPanel(), "#current-panel": _RecordingPanel()}
+    review.query_one = lambda selector, expect=None: panels[selector]
+    return review, panels["#draft-panel"], panels["#current-panel"]
+
+
+def test_update_panels_writes_draft_and_status_bodies_as_markdown():
+    review, draft_panel, current_panel = _panels_review()
+    ReviewScreen._update_panels(review)
+
+    for panel in (draft_panel, current_panel):
+        bodies = [w for w in panel.writes if isinstance(w, Markdown)]
+        assert len(bodies) == 1
+    assert any("New draft — ABC-1" in w for w in draft_panel.writes if isinstance(w, str))
+    assert any("Previous status — ABC-1" in w for w in current_panel.writes if isinstance(w, str))
+
+
+def test_update_panels_renders_pr_references_as_osc8_hyperlinks():
+    review, draft_panel, current_panel = _panels_review()
+    ReviewScreen._update_panels(review)
+
+    for panel in (draft_panel, current_panel):
+        body = next(w for w in panel.writes if isinstance(w, Markdown))
+        console = Console(file=io.StringIO(), force_terminal=True, width=80)
+        console.print(body)
+        rendered = console.file.getvalue()
+        assert "\x1b]8;" in rendered, "expected an OSC 8 hyperlink escape"
+        assert "owner/repo#" in rendered, "expected the link label to survive rendering"
+
+
+def test_update_panels_none_filed_placeholder_stays_plain():
+    review, _, current_panel = _panels_review()
+    review.current_statuses = {}
+    ReviewScreen._update_panels(review)
+    assert current_panel.writes == ["[bold]Previous status — ABC-1[/bold]\n\n[dim](none filed)[/dim]"]
+
+
+def test_update_panels_keeps_unknown_html_visible():
+    # rich.markdown silently drops HTML other than <kbd>; placeholders like
+    # <repo> and generics like <T> must survive instead of vanishing.
+    review, draft_panel, _ = _panels_review()
+    review.drafts = {
+        "ABC-1": "See <repo>#1, generics <T>, and code `<repo>`.\n\n<repo>\n"
+    }
+    ReviewScreen._update_panels(review)
+
+    body = next(w for w in draft_panel.writes if isinstance(w, Markdown))
+    console = Console(file=io.StringIO(), force_terminal=False, width=80)
+    console.print(body)
+    rendered = console.file.getvalue()
+    assert "<repo>#1" in rendered
+    assert "<T>" in rendered
+    assert rendered.count("<repo>") == 3  # inline, code span, and block line
+
+
+def test_update_panels_keeps_bracketed_publication_error():
+    # Raw Jira errors can contain [bracketed] field names, which the console
+    # markup parser would swallow if interpolated into a markup string.
+    review, draft_panel, _ = _panels_review()
+    review.results = {
+        "ABC-1": ReviewResult(
+            "ABC-1", "approved", "Green", "draft",
+            publication_state="failed",
+            publication_error="The field [customfield_10814] is invalid",
+        )
+    }
+    ReviewScreen._update_panels(review)
+
+    errors = [w for w in draft_panel.writes if isinstance(w, Text)]
+    assert len(errors) == 1
+    assert "[customfield_10814]" in str(errors[0])
+
+
+def test_panels_fit_narrow_terminal_without_horizontal_scrollbar():
+    class ReviewProbe(App):
+        def __init__(self):
+            super().__init__()
+            self.review = ReviewScreen(
+                issues=[{"key": "ABC-1", "summary": "A summary"}],
+                drafts={"ABC-1": "* Color Status: Green\nDraft body with a link."},
+                summaries={},
+                current_statuses={"ABC-1": "Previous status body."},
+                client=None, model="model", usage=None,
+                jira_url="https://example.com", auth_headers={},
+            )
+
+        def on_mount(self):
+            self.push_screen(self.review)
+
+    async def check():
+        app = ReviewProbe()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            for selector in ("#draft-panel", "#current-panel"):
+                panel = app.review.query_one(selector)
+                assert not panel.show_horizontal_scrollbar
+                assert panel.virtual_size.width == panel.scrollable_content_region.width
+
+    asyncio.run(check())
 
 
 # ─── extract_color ───────────────────────────────────────────────────────────
