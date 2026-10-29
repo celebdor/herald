@@ -31,8 +31,31 @@ url = "https://redhat.atlassian.net"
 # Uncomment and set if you want to pin a specific local checkout:
 # skills_dir = "~/src/ai-helpers/plugins/jira/skills/status-analysis"
 
+# Named profiles save a parameter set so a team can report with one command:
+#   herald --project OCPSTRAT --profile ocpstrat-hcp
+# A profile key may be any CLI option (using its long-flag name with dashes
+# turned into underscores); it fills in the option only when the flag is not
+# passed on the command line. Supported keys:
+#   project      Jira project key (also required on the CLI)
+#   component    filter by component
+#   label        filter by label
+#   assignee     list of assignee emails to include
+#   exclude      list of assignee emails to exclude
+#   start_date   start date, "YYYY-MM-DD"
+#   end_date     end date, "YYYY-MM-DD"
+#   days         lookback window in days (default: 7)
+#   skip_quiet   true to skip issues with no significant activity
+#   model        Anthropic model override for this profile
+#   output_dir   output directory for gathered data (default: .work/weekly-status)
 [profiles.ocpstrat-hcp]
 project = "OCPSTRAT"
 component = "Hosted Control Planes"
 label = "control-plane-work"
+assignee = ["alice@redhat.com", "bob@redhat.com"]
 exclude = ["davegord@redhat.com", "aambewad@redhat.com"]
+# start_date = "2026-08-01"
+# end_date = "2026-08-15"
+# days = 7
+# skip_quiet = true
+# model = "claude-sonnet-5"
+# output_dir = ".work/weekly-status"

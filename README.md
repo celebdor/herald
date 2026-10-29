@@ -82,8 +82,19 @@ url = "https://redhat.atlassian.net"
 project = "MYPROJ"
 component = "My Component"
 label = "my-label"
+assignee = ["alice@example.com"]
 exclude = ["bot@example.com"]
+# start_date = "2026-08-01"
+# end_date = "2026-08-15"
+# skip_quiet = true
+# model = "claude-sonnet-5"
 ```
+
+A profile key may be any CLI option (using its long-flag name with dashes
+turned into underscores); it fills in that option only when the flag is not
+passed on the command line. Supported keys: `project`, `component`, `label`,
+`assignee`, `exclude`, `start_date`, `end_date`, `days`, `skip_quiet`,
+`model`, and `output_dir`.
 
 ### Reporting rules (status-analysis skill)
 
