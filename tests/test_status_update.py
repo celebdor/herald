@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import base64
+import io
 import json
 import os
 from pathlib import Path
@@ -10,6 +11,8 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from rich.console import Console
+from rich.markdown import Markdown
 
 from herald.app import ReviewResult, ReviewScreen, edit_in_editor, extract_color, publish_validated_draft
 from herald.config import (
@@ -439,6 +442,67 @@ def test_quit_waits_for_pending_publication():
     asyncio.run(run_quit())
     assert review.dismissed == [result]
     assert result.publication_state == "published"
+
+
+# ─── _update_panels markdown rendering ───────────────────────────────────────
+
+class _RecordingPanel:
+    """Stand-in for a RichLog panel that records write() calls."""
+
+    def __init__(self):
+        self.writes = []
+
+    def clear(self):
+        self.writes.clear()
+
+    def write(self, item):
+        self.writes.append(item)
+
+    def scroll_home(self, animate=False):
+        pass
+
+
+def _panels_review():
+    review = SimpleNamespace(
+        drafts={"ABC-1": "Worked on [owner/repo#1](https://example.com/pull/1)."},
+        current_statuses={"ABC-1": "Fixed in [owner/repo#2](https://example.com/pull/2)."},
+        results={},
+        _current_key=lambda: "ABC-1",
+    )
+    panels = {"#draft-panel": _RecordingPanel(), "#current-panel": _RecordingPanel()}
+    review.query_one = lambda selector, expect=None: panels[selector]
+    return review, panels["#draft-panel"], panels["#current-panel"]
+
+
+def test_update_panels_writes_draft_and_status_bodies_as_markdown():
+    review, draft_panel, current_panel = _panels_review()
+    ReviewScreen._update_panels(review)
+
+    for panel in (draft_panel, current_panel):
+        bodies = [w for w in panel.writes if isinstance(w, Markdown)]
+        assert len(bodies) == 1
+    assert any("New draft — ABC-1" in w for w in draft_panel.writes if isinstance(w, str))
+    assert any("Previous status — ABC-1" in w for w in current_panel.writes if isinstance(w, str))
+
+
+def test_update_panels_renders_pr_references_as_osc8_hyperlinks():
+    review, draft_panel, current_panel = _panels_review()
+    ReviewScreen._update_panels(review)
+
+    for panel in (draft_panel, current_panel):
+        body = next(w for w in panel.writes if isinstance(w, Markdown))
+        console = Console(file=io.StringIO(), force_terminal=True, width=80)
+        console.print(body)
+        rendered = console.file.getvalue()
+        assert "\x1b]8;" in rendered, "expected an OSC 8 hyperlink escape"
+        assert "owner/repo#" in rendered, "expected the link label to survive rendering"
+
+
+def test_update_panels_none_filed_placeholder_stays_plain():
+    review, _, current_panel = _panels_review()
+    review.current_statuses = {}
+    ReviewScreen._update_panels(review)
+    assert current_panel.writes == ["[bold]Previous status — ABC-1[/bold]\n\n[dim](none filed)[/dim]"]
 
 
 # ─── extract_color ───────────────────────────────────────────────────────────
