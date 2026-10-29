@@ -153,6 +153,9 @@ When `coding_agent` is configured in prefs, `i` suspends the TUI and opens the a
 uv run pytest tests/ -v
 ```
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development workflows, including
+how to re-run the app against an older gather cache when iterating on the TUI.
+
 ## Design specifications
 
 See [specs/](specs/README.md) for the exact initial drafting API inputs and
