@@ -83,6 +83,11 @@ project = "MYPROJ"
 component = "My Component"
 label = "my-label"
 exclude = ["bot@example.com"]
+
+[profiles.my-jql-team]
+# --jql is used verbatim and overrides project/component/label/assignee/exclude,
+# including the gatherer's built-in status filters.
+jql = 'project = MYPROJ AND assignee = "me@example.com" AND cf[10855] = "openshift-5.1" ORDER BY rank ASC'
 ```
 
 ### Profiles (shorthand arguments)
@@ -91,9 +96,10 @@ A profile is a named set of arguments saved under `[profiles.<name>]` in
 `prefs.toml`. Select one with `--profile <name>` and you don't need to repeat
 the filters on every run. A profile can set any command-line option by its
 long name without the leading dashes: `project`, `component`, `label`,
-`assignee`, `exclude`, `days`, `start_date`, `end_date`, `output_dir`, `model`,
-and so on. Write a name with `_` or `-` (`start_date` and `start-date` both
-work). List-valued options (`assignee`, `exclude`) take a TOML array.
+`assignee`, `exclude`, `days`, `start_date`, `end_date`, `output_dir`, `jql`,
+`model`, and so on. Write a name with `_` or `-` (`start_date` and
+`start-date` both work). List-valued options (`assignee`, `exclude`) take a
+TOML array.
 
 ```toml
 # Issues assigned to you in one project
@@ -114,7 +120,19 @@ herald --profile hpstrat-me
 How profiles are applied:
 
 - `--project` is optional when the profile sets `project`. Herald exits with an
-  error if neither supplies one.
+  error if neither it nor `--jql` supplies a way to select issues.
+- `jql` selects root issues with a verbatim Jira query and replaces the
+  gatherer's built-in `project`/`component`/`label`/`assignee`/`exclude` query,
+  including its `status != Closed` and `status != "Release Pending"` guards.
+  A profile that sets `jql` therefore ignores its own `project`, `component`,
+  `label`, `assignee`, and `exclude` values, and must express any status
+  filtering in the query itself. Use it for filters Herald does not model, such
+  as target version:
+
+  ```toml
+  [profiles.ocpstrat-storage]
+  jql = 'project = OCPSTRAT AND assignee = "me@example.com" AND cf[10855] = "openshift-5.1" ORDER BY rank ASC'
+  ```
 - Options you pass on the command line take precedence over the profile, so
   `herald --profile ocpstrat-me --project HPSTRAT` queries HPSTRAT. This holds
   even when the value you pass equals the built-in default (`--days 7` beats a
@@ -152,6 +170,9 @@ herald --profile my-team
 
 # Override a profile value from the command line
 herald --profile my-team --project OTHERPROJ
+
+# Selecting root issues with custom JQL (no --project needed)
+herald --jql 'project = OCPSTRAT AND cf[10855] = "openshift-5.1" ORDER BY rank ASC'
 
 # Force re-gather (ignore cache)
 herald --project OCPSTRAT --refresh
