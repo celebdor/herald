@@ -1142,43 +1142,105 @@ def test_load_current_statuses_converts_adf_to_markdown(tmp_path):
 
 # ─── Profile CLI override ────────────────────────────────────────────────────
 
-def test_profile_values_fill_missing_cli_args():
-    prefs = UserPrefs(
-        profiles={"my-profile": {"component": "Profile Component", "label": "profile-label"}}
-    )
-    args = argparse.Namespace(
-        project="TEST",
-        component="CLI Component",  # explicitly set — must NOT be overridden
-        label=None,                  # not set — profile should fill this in
-        profile="my-profile",
-    )
+def _resolve(argv, **profiles):
+    from herald.cli import resolve_args
 
-    if args.profile and args.profile in prefs.profiles:
-        for key, value in prefs.profiles[args.profile].items():
-            if not getattr(args, key, None):
-                setattr(args, key, value)
+    args, _ = resolve_args(argv, prefs=UserPrefs(profiles=profiles))
+    return args
+
+
+def test_profile_values_fill_missing_cli_args():
+    args = _resolve(
+        ["--project", "TEST", "--component", "CLI Component", "--profile", "my-profile"],
+        **{"my-profile": {"component": "Profile Component", "label": "profile-label"}},
+    )
 
     assert args.component == "CLI Component"   # CLI wins
     assert args.label == "profile-label"       # profile fills missing
 
 
 def test_profile_does_not_override_explicitly_set_args():
-    prefs = UserPrefs(
-        profiles={"p": {"component": "Profile", "label": "plabel", "model": "claude-haiku-4-5"}}
+    args = _resolve(
+        ["--project", "TEST", "--component", "My Component", "--label", "my-label", "--profile", "p"],
+        p={"component": "Profile", "label": "plabel", "model": "claude-haiku-4-5"},
     )
-    args = argparse.Namespace(
-        project="TEST",
-        component="My Component",
-        label="my-label",
-        model=None,
-        profile="p",
-    )
-
-    if args.profile and args.profile in prefs.profiles:
-        for key, value in prefs.profiles[args.profile].items():
-            if not getattr(args, key, None):
-                setattr(args, key, value)
 
     assert args.component == "My Component"
     assert args.label == "my-label"
-    assert args.model == "claude-haiku-4-5"  # profile fills model (was None)
+    assert args.model == "claude-haiku-4-5"  # profile fills model (was unset)
+
+
+def test_profile_supplies_project():
+    args = _resolve(
+        ["--profile", "p"],
+        p={"project": "OCPSTRAT", "assignee": ["me@example.com"]},
+    )
+
+    assert args.project == "OCPSTRAT"
+    assert args.assignee == ["me@example.com"]
+
+
+def test_cli_project_wins_over_profile():
+    args = _resolve(["--project", "HPSTRAT", "--profile", "p"], p={"project": "OCPSTRAT"})
+
+    assert args.project == "HPSTRAT"
+
+
+def test_profile_can_set_options_that_have_argparse_defaults():
+    args = _resolve(
+        ["--profile", "p"],
+        p={"project": "X", "days": 3, "output_dir": "/tmp/out"},
+    )
+
+    assert args.days == 3
+    assert args.output_dir == "/tmp/out"
+
+
+def test_explicit_cli_value_equal_to_default_still_beats_profile():
+    args = _resolve(["--profile", "p", "--days", "7"], p={"project": "X", "days": 3})
+
+    assert args.days == 7
+
+
+def test_profile_keys_accept_hyphens():
+    args = _resolve(
+        ["--profile", "p"],
+        p={"project": "X", "start-date": "2026-10-01", "end_date": "2026-10-08"},
+    )
+
+    assert args.start_date == "2026-10-01"
+    assert args.end_date == "2026-10-08"
+
+
+def test_cli_list_option_replaces_profile_list():
+    args = _resolve(
+        ["--profile", "p", "--assignee", "cli@example.com"],
+        p={"project": "X", "assignee": ["profile@example.com"]},
+    )
+
+    assert args.assignee == ["cli@example.com"]
+
+
+def test_profile_with_unknown_key_is_an_error(capsys):
+    with pytest.raises(SystemExit):
+        _resolve(["--profile", "p"], p={"project": "X", "componnet": "Y"})
+
+    err = capsys.readouterr().err
+    assert "unknown option(s): componnet" in err
+    assert "component" in err  # valid options are listed
+
+
+def test_profile_errors_without_project(capsys):
+    with pytest.raises(SystemExit):
+        _resolve(["--profile", "p"], p={"label": "x"})
+
+    assert "--project is required" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        _resolve([])
+
+
+def test_unknown_profile_name_is_an_error(capsys):
+    with pytest.raises(SystemExit):
+        _resolve(["--project", "X", "--profile", "typo"])
+
+    assert "profile 'typo' not found" in capsys.readouterr().err
