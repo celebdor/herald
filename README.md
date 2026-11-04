@@ -85,6 +85,47 @@ label = "my-label"
 exclude = ["bot@example.com"]
 ```
 
+### Profiles (shorthand arguments)
+
+A profile is a named set of arguments saved under `[profiles.<name>]` in
+`prefs.toml`. Select one with `--profile <name>` and you don't need to repeat
+the filters on every run. A profile can set any command-line option by its
+long name without the leading dashes: `project`, `component`, `label`,
+`assignee`, `exclude`, `days`, `start_date`, `end_date`, `output_dir`, `model`,
+and so on. Write a name with `_` or `-` (`start_date` and `start-date` both
+work). List-valued options (`assignee`, `exclude`) take a TOML array.
+
+```toml
+# Issues assigned to you in one project
+[profiles.ocpstrat-me]
+project = "OCPSTRAT"
+assignee = ["you@example.com"]   # assignees are matched by email, not display name
+
+[profiles.hpstrat-me]
+project = "HPSTRAT"
+assignee = ["you@example.com"]
+```
+
+```bash
+herald --profile ocpstrat-me
+herald --profile hpstrat-me
+```
+
+How profiles are applied:
+
+- `--project` is optional when the profile sets `project`. Herald exits with an
+  error if neither supplies one.
+- Options you pass on the command line take precedence over the profile, so
+  `herald --profile ocpstrat-me --project HPSTRAT` queries HPSTRAT. This holds
+  even when the value you pass equals the built-in default (`--days 7` beats a
+  profile's `days = 3`). A list option you pass, such as `--assignee`, replaces
+  the profile's list instead of adding to it.
+- Herald exits with an error if `--profile` names a profile that isn't in
+  `prefs.toml`, or if a profile contains a key that isn't a command-line option
+  (for example a misspelled `componnet`). The error lists the valid options.
+- `--project` and `--component` each take a single value. To cover several
+  projects or components, define one profile for each and run them in turn.
+
 ### Reporting rules (status-analysis skill)
 
 Herald's R/Y/G analysis and output format come from the `status-analysis`
@@ -106,8 +147,11 @@ rules across teams.
 # Basic usage
 herald --project OCPSTRAT --component "Hosted Control Planes"
 
-# Using a saved profile
-herald --project OCPSTRAT --profile my-team
+# Using a saved profile (project comes from the profile)
+herald --profile my-team
+
+# Override a profile value from the command line
+herald --profile my-team --project OTHERPROJ
 
 # Force re-gather (ignore cache)
 herald --project OCPSTRAT --refresh
