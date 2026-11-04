@@ -61,12 +61,20 @@ On Linux, `<state-dir>` is `$XDG_STATE_HOME/herald` or `~/.local/state/herald`.
 Existing `<date-dir>/drafts.json` and `draft_inputs.json` files are read as a
 legacy fallback; the next save writes them under `<state-dir>`.
 
-For the temporal evidence contract, the manifest supplies `reporting_window`
-with offset-aware `start`, `end_exclusive`, and IANA `timezone`. Its interval is
-half-open. Date-only CLI bounds must be resolved by the external gatherer in
-that timezone. Herald adds a UTC `gathered_at` timestamp after each fresh full
-gather and records capture times in `issue_gathered_at`. A single-issue refresh
-updates only that issue's time; untouched legacy issue data stays unknown.
+For the temporal evidence contract, Herald resolves `reporting_window` from the
+manifest: a valid recorded window (offset-aware `start`, `end_exclusive`, IANA
+`timezone`) is used as-is, and otherwise Herald derives one from the gatherer's
+date-only `config.date_range` — `start` at midnight UTC of the start date,
+`end_exclusive` at midnight UTC of the day after the end date, `timezone`
+`"UTC"` — and writes it back into the persisted manifest. The interval is
+half-open. The gatherer selects events by comparing each timestamp's own date,
+inclusive at both ends, without timezone conversion; the midnight-UTC half-open
+bounds reproduce that selection for the UTC-offset timestamps Jira and GitHub
+emit. A window that cannot be resolved is represented to the model as unknown
+and produces a warning. Herald adds a UTC `gathered_at` timestamp after each
+fresh full gather and records capture times in `issue_gathered_at`. A
+single-issue refresh updates only that issue's time and carries the freshly
+resolved window; untouched legacy issue data stays unknown.
 Legacy/malformed window or timestamp metadata is represented to the model as
 unknown. Issue files should provide dated `events_in_window`,
 `carry_forward_context`, and explicit `undated_activity`; Herald checks event

@@ -1,0 +1,17 @@
+{
+  "generated_at": "2026-10-28T13:49:11.631017",
+  "config": {
+    "project": "OCPSTRAT",
+    "date_range": {
+      "start": "2026-10-21",
+      "end": "2026-10-28"
+    }
+  },
+  "gathered_at": "2026-10-28T12:49:11.685437+00:00",
+  "reporting_window": {
+    "start": "2026-10-21T00:00:00+00:00",
+    "end_exclusive": "2026-10-29T00:00:00+00:00",
+    "timezone": "UTC"
+  },
+  "issues": []
+}
