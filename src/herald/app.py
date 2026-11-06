@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 import aiohttp
+from rich.markdown import Markdown
 from rich.style import Style
 from rich.text import Text
 
@@ -364,7 +365,11 @@ class ReviewScreen(Screen):
         draft = self.drafts.get(key, "(no draft)")
         draft_panel = self.query_one("#draft-panel", RichLog)
         draft_panel.clear()
-        draft_panel.write(f"[bold]New draft — {key}[/bold]\n\n{draft}")
+        # Drafts are Markdown: render them via rich.markdown so [label](url)
+        # PR references become OSC 8 hyperlinks instead of having their labels
+        # eaten by the console markup parser.
+        draft_panel.write(f"[bold]New draft — {key}[/bold]\n\n")
+        draft_panel.write(Markdown(draft))
         result = self.results.get(key)
         if result and result.publication_error:
             draft_panel.write(
@@ -377,7 +382,8 @@ class ReviewScreen(Screen):
         current_panel = self.query_one("#current-panel", RichLog)
         current_panel.clear()
         if previous:
-            current_panel.write(f"[bold]Previous status — {key}[/bold]\n\n{previous}")
+            current_panel.write(f"[bold]Previous status — {key}[/bold]\n\n")
+            current_panel.write(Markdown(previous))
         else:
             current_panel.write(f"[bold]Previous status — {key}[/bold]\n\n[dim](none filed)[/dim]")
         current_panel.scroll_home(animate=False)
