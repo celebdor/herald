@@ -16,6 +16,7 @@ from herald.config import (
     DEFAULT_MAX_TOKENS,
     MAX_CONFIGURED_MAX_TOKENS,
     UserPrefs,
+    _cache_key,
     find_scripts_dir,
     find_skills_dir,
     load_prefs,
@@ -252,6 +253,26 @@ project = "TEST"
     assert prefs.jira_url == "https://example.atlassian.net"
     assert prefs.skills_dir == "/custom/skills"
     assert "myprofile" in prefs.profiles
+
+
+def test_cache_key_separates_distinct_custom_jql():
+    base = dict(
+        project=None, component=None, label=None,
+        assignee=None, exclude=None, days=7,
+        start_date=None, end_date=None,
+    )
+    first = _cache_key(argparse.Namespace(jql="project = A", **base))
+    second = _cache_key(argparse.Namespace(jql="project = B", **base))
+    none_jql = _cache_key(argparse.Namespace(jql=None, **base))
+
+    assert len({first, second, none_jql}) == 3
+
+
+def test_cache_key_accepts_jql_only_invocation():
+    """JQL-only runs have project=None; the key must still be derivable."""
+    key = _cache_key(argparse.Namespace(jql="project = A", project=None))
+
+    assert isinstance(key, str) and len(key) == 16
 
 
 def test_load_prefs_partial_fills_defaults(tmp_path):
@@ -1237,6 +1258,32 @@ def test_profile_errors_without_project(capsys):
     assert "--project is required" in capsys.readouterr().err
     with pytest.raises(SystemExit):
         _resolve([])
+
+
+def test_profile_supplies_jql_without_project(capsys):
+    args = _resolve(
+        ["--profile", "p"],
+        p={"jql": 'project = X AND cf[10855] = "openshift-5.1"'},
+    )
+
+    assert args.project is None
+    assert args.jql == 'project = X AND cf[10855] = "openshift-5.1"'
+    assert capsys.readouterr().err == ""
+
+
+def test_cli_jql_only_invocation_is_accepted():
+    args = _resolve(["--jql", "project = X"])
+
+    assert args.project is None
+    assert args.jql == "project = X"
+
+
+def test_cli_jql_satisfies_requirement_when_profile_has_no_project(capsys):
+    args = _resolve(["--jql", "project = X", "--profile", "p"], p={"label": "x"})
+
+    assert args.jql == "project = X"
+    assert args.label == "x"
+    assert capsys.readouterr().err == ""
 
 
 def test_unknown_profile_name_is_an_error(capsys):

@@ -26,9 +26,18 @@ Environment variables:
   ANTHROPIC_VERTEX_PROJECT_ID  Use Vertex AI instead of direct API
 """,
     )
-    parser.add_argument("--project", help="Jira project key (e.g. OCPSTRAT); may come from --profile")
+    parser.add_argument(
+        "--project",
+        help="Jira project key (e.g. OCPSTRAT); may come from --profile, "
+             "required unless --jql is given",
+    )
     parser.add_argument("--component", help="Filter by component")
     parser.add_argument("--label", help="Filter by label")
+    parser.add_argument(
+        "--jql",
+        help="Custom JQL selecting root issues; used verbatim and overrides "
+             "--project/--component/--label/--assignee/--exclude",
+    )
     parser.add_argument("--assignee", action="append", help="Filter by assignee email (repeatable)")
     parser.add_argument("--exclude", action="append", help="Exclude assignee email (repeatable)")
     parser.add_argument("--days", type=int, default=7, help="Lookback days (default: 7)")
@@ -87,8 +96,8 @@ def apply_profile(
         for key, value in profile.items():
             if key not in explicit:
                 setattr(args, key, value)
-    if not args.project:
-        parser.error("--project is required (or set project in the --profile)")
+    if not args.project and not getattr(args, "jql", None):
+        parser.error("--project is required (or set project in the --profile, or pass --jql)")
 
 
 def resolve_args(argv: Optional[list[str]] = None, prefs=None):
