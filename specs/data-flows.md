@@ -101,10 +101,13 @@ the previous calendar week's report or a freshly re-read Jira value.
 
 There are two separate caches:
 
-1. **Gather reuse:** a SHA-256-derived key covers project, component, label,
-   sorted assignees/exclusions, days, and explicit start/end dates. Cache metadata
-   must have been written on the current UTC day and point to an existing
-   manifest. A hit skips the subprocess. `--refresh` bypasses this lookup.
+1. **Gather reuse:** a SHA-256-derived key covers project, custom JQL, component,
+   label, sorted assignees/exclusions, days, and explicit start/end dates. Every
+   one of these values is hashed even when custom JQL makes the filters
+   irrelevant to root selection, so only identical option sets share a cache
+   entry. Cache metadata must have been written on the current UTC day and point
+   to an existing manifest. A hit skips the subprocess. `--refresh` bypasses
+   this lookup.
 2. **Draft reuse:** State `drafts.json` maps issue keys to text for each output
    directory and date. `draft_inputs.json` stores a SHA-256 fingerprint of the exact pruned JSON
    input. Herald reuses a draft only when that fingerprint matches; source,
