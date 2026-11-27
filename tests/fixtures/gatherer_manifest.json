@@ -1,0 +1,30 @@
+{
+  "generated_at": "2026-10-28T13:49:11.631017",
+  "config": {
+    "project": "OCPSTRAT",
+    "component": "Hosted Control Planes",
+    "label": "control-plane-work",
+    "date_range": {
+      "start": "2026-10-21",
+      "end": "2026-10-28"
+    },
+    "status_summary_field": "customfield_10814"
+  },
+  "issues": [
+    {
+      "key": "OCPSTRAT-3554",
+      "summary": "OpenShift Control Plane Performance and Scale Regression Testing for OCP 5.0",
+      "assignee": "example-lead@example.com",
+      "status": "In Progress",
+      "descendants_count": 16,
+      "prs_count": 2
+    }
+  ],
+  "stats": {
+    "total_issues": 1,
+    "total_descendants": 16,
+    "total_prs": 2,
+    "jira_requests": 42,
+    "fetch_duration_seconds": 12.34
+  }
+}

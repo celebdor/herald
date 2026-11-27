@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit
@@ -95,6 +95,77 @@ def _temporal_context(manifest: Optional[dict], issue_key: Optional[str] = None)
     }
 
 
+def _window_is_valid(window) -> bool:
+    """Return True when a recorded reporting window is usable as-is."""
+    if not isinstance(window, dict):
+        return False
+    start = _parse_instant(window.get("start"))
+    end = _parse_instant(window.get("end_exclusive"))
+    try:
+        ZoneInfo(window.get("timezone"))
+    except (ZoneInfoNotFoundError, TypeError, ValueError):
+        return False
+    return bool(start and end and start < end)
+
+
+def _derived_reporting_window(manifest: dict) -> Optional[dict]:
+    """Derive a UTC reporting window from the gatherer's date-only date_range.
+
+    The gatherer selects events by comparing each timestamp's own date,
+    inclusive at both ends, with no timezone conversion. Midnight-UTC
+    half-open bounds reproduce that selection exactly for the UTC-offset
+    timestamps that Jira and GitHub emit.
+    """
+    config = manifest.get("config")
+    if not isinstance(config, dict):
+        return None
+    date_range = config.get("date_range")
+    if not isinstance(date_range, dict):
+        return None
+    try:
+        start_date = date.fromisoformat(date_range["start"])
+        end_date = date.fromisoformat(date_range["end"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if end_date < start_date:
+        return None
+    start = datetime.combine(start_date, datetime.min.time(), tzinfo=timezone.utc)
+    end_exclusive = datetime.combine(
+        end_date + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc
+    )
+    return {
+        "start": start.isoformat(),
+        "end_exclusive": end_exclusive.isoformat(),
+        "timezone": "UTC",
+    }
+
+
+def _ensure_reporting_window(manifest: dict) -> Optional[dict]:
+    """Return a usable reporting window, deriving one when needed.
+
+    A valid recorded window wins. Otherwise the window is derived from the
+    gatherer's date range and written back, so the persisted manifest and the
+    drafting input agree. Returns None when no window can be resolved.
+    """
+    if _window_is_valid(manifest.get("reporting_window")):
+        return manifest["reporting_window"]
+    derived = _derived_reporting_window(manifest)
+    if derived is not None:
+        manifest["reporting_window"] = derived
+    return derived
+
+
+async def _warn_unresolved_window(line_callback) -> None:
+    message = (
+        "Warning: reporting window unresolved; dated events cannot be "
+        "classified as in-window"
+    )
+    if line_callback:
+        await line_callback(message)
+    else:
+        print(message, file=sys.stderr)
+
+
 def _persist_manifest(date_dir: Path, manifest: dict) -> None:
     path = date_dir / "manifest.json"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -120,9 +191,16 @@ async def run_gather(
     if not refresh:
         cached = _find_cached_gather(args)
         if cached:
+            date_dir, cached_manifest = cached
             if line_callback:
-                await line_callback(f"Using cached data from {cached[0]}")
-            return cached
+                await line_callback(f"Using cached data from {date_dir}")
+            had_window = _window_is_valid(cached_manifest.get("reporting_window"))
+            if _ensure_reporting_window(cached_manifest):
+                if not had_window:
+                    _persist_manifest(date_dir, cached_manifest)
+            else:
+                await _warn_unresolved_window(line_callback)
+            return date_dir, cached_manifest
     cmd = [
         sys.executable,
         str(scripts_dir / "gather_status_data.py"),
@@ -182,6 +260,9 @@ async def run_gather(
         if issue.get("key") and (gathered_keys is None or issue["key"] in gathered_keys)
     }
 
+    if not _ensure_reporting_window(new_manifest):
+        await _warn_unresolved_window(line_callback)
+
     if issue_keys:
         manifest_path = date_dir / "manifest.json"
         if manifest_path.exists():
@@ -197,8 +278,8 @@ async def run_gather(
                 issue_timestamps = {}
             issue_timestamps.update(new_manifest["issue_gathered_at"])
             existing["issue_gathered_at"] = issue_timestamps
-            # Preserve a resolved window only when the gatherer supplies one.
-            existing.pop("reporting_window", None)
+            # A refresh carries the freshly resolved window; when it has none,
+            # keep the previously recorded one rather than dropping it.
             if isinstance(new_manifest.get("reporting_window"), dict):
                 existing["reporting_window"] = new_manifest["reporting_window"]
             _persist_manifest(date_dir, existing)
