@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 import aiohttp
+from rich.markdown import Markdown, MarkdownElement
 from rich.style import Style
 from rich.text import Text
 
@@ -90,6 +91,48 @@ def edit_in_editor(draft_text: str) -> Optional[str]:
     os.unlink(tmppath)
     result = "".join(lines).strip()
     return result if result else None
+
+
+class _LiteralHtmlBlock(MarkdownElement):
+    """Render a block of HTML literally instead of dropping it.
+
+    rich.markdown has no renderer for html_block tokens, so a placeholder line
+    like a lone <repo> disappears entirely.
+    """
+
+    @classmethod
+    def create(cls, markdown, token):
+        element = cls()
+        element.content = (token.content or "").rstrip("\n")
+        return element
+
+    def __rich_console__(self, console, options):
+        yield Text(self.content)
+
+
+class _DraftMarkdown(Markdown):
+    elements = {**Markdown.elements, "html_block": _LiteralHtmlBlock}
+
+
+def _markdown_body(text: str) -> Markdown:
+    """Render Markdown without silently dropping inline HTML it doesn't know.
+
+    rich.markdown only understands <kbd>; every other html_inline token hits a
+    bare `continue` and vanishes, so placeholders like <repo> or generics like
+    <T> disappear from status text. Rewriting those tokens as literal text
+    keeps them visible while leaving code spans and <kbd> untouched.
+    """
+    markdown = _DraftMarkdown(text)
+    _literalize_html_tokens(markdown.parsed)
+    return markdown
+
+
+def _literalize_html_tokens(tokens) -> None:
+    for token in tokens:
+        if getattr(token, "children", None):
+            _literalize_html_tokens(token.children)
+        if token.type == "html_inline" and token.content not in ("<kbd>", "</kbd>"):
+            token.type = "text"
 
 
 class ScrollPane(RichLog):
@@ -262,8 +305,14 @@ class ReviewScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Header()
         yield IssueTable(id="issue-table")
-        yield ScrollPane(id="draft-panel", highlight=True, markup=True, auto_scroll=False)
-        yield ScrollPane(id="current-panel", highlight=True, markup=True, auto_scroll=False)
+        yield ScrollPane(
+            id="draft-panel", highlight=True, markup=True, auto_scroll=False,
+            wrap=True, min_width=0,
+        )
+        yield ScrollPane(
+            id="current-panel", highlight=True, markup=True, auto_scroll=False,
+            wrap=True, min_width=0,
+        )
         yield Input(placeholder="Describe the changes you want...", id="request-input")
         yield Input(placeholder="Search issues by key or summary...", id="search-input")
         yield Static("", id="status-bar")
@@ -364,20 +413,27 @@ class ReviewScreen(Screen):
         draft = self.drafts.get(key, "(no draft)")
         draft_panel = self.query_one("#draft-panel", RichLog)
         draft_panel.clear()
-        draft_panel.write(f"[bold]New draft — {key}[/bold]\n\n{draft}")
+        # Drafts are Markdown: render them via rich.markdown so [label](url)
+        # PR references become OSC 8 hyperlinks instead of having their labels
+        # eaten by the console markup parser.
+        draft_panel.write(f"[bold]New draft — {key}[/bold]\n")
+        draft_panel.write(_markdown_body(draft))
         result = self.results.get(key)
         if result and result.publication_error:
             draft_panel.write(
-                f"\n\n[bold red]Publication {result.publication_state}[/bold red]\n"
-                f"{result.publication_error}\nPress p to retry."
+                f"\n[bold red]Publication {result.publication_state}[/bold red]\n"
             )
+            # Raw Jira responses can contain [bracketed] field names; keep them
+            # out of the markup parser so they aren't swallowed.
+            draft_panel.write(Text(f"{result.publication_error}\nPress p to retry."))
         draft_panel.scroll_home(animate=False)
 
         previous = self.current_statuses.get(key, "")
         current_panel = self.query_one("#current-panel", RichLog)
         current_panel.clear()
         if previous:
-            current_panel.write(f"[bold]Previous status — {key}[/bold]\n\n{previous}")
+            current_panel.write(f"[bold]Previous status — {key}[/bold]\n")
+            current_panel.write(_markdown_body(previous))
         else:
             current_panel.write(f"[bold]Previous status — {key}[/bold]\n\n[dim](none filed)[/dim]")
         current_panel.scroll_home(animate=False)
