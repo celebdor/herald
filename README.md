@@ -43,16 +43,55 @@ uv sync
 
 ## Configuration
 
-### Environment variables (required)
+### Environment variables
 
 | Variable | Description |
 |----------|-------------|
 | `JIRA_USERNAME` | Atlassian account email |
 | `JIRA_API_TOKEN` | [Atlassian API token](https://id.atlassian.com/manage-profile/security/api-tokens) |
 | `GITHUB_TOKEN` | GitHub personal access token |
-| `ANTHROPIC_API_KEY` | Anthropic API key (direct API) |
+| `ANTHROPIC_API_KEY` | Anthropic API key, or your gateway's token (direct API) |
+| `ANTHROPIC_BASE_URL` | Anthropic-compatible endpoint (optional; see below) |
 
 For Vertex AI instead of the direct API, set `ANTHROPIC_VERTEX_PROJECT_ID` (and optionally `CLOUD_ML_REGION`, default `us-east5`).
+
+#### Using an Anthropic-compatible endpoint
+
+Herald sends drafting and revision requests through the Anthropic Messages
+API. To route them through a gateway or proxy that implements that API, point
+the SDK at it with environment variables and set the gateway's model id in
+`prefs.toml`:
+
+```bash
+export ANTHROPIC_BASE_URL="https://llm-gateway.example.com"
+export ANTHROPIC_API_KEY="<gateway token>"   # or ANTHROPIC_AUTH_TOKEN
+```
+
+```toml
+[llm]
+model = "vendor/model-name"   # the id the gateway publishes
+max_tokens = 16384            # reasoning tokens share this budget
+```
+
+The Anthropic SDK appends `/v1/messages` to the base URL. If the gateway
+serves the API under a path prefix, include that prefix in
+`ANTHROPIC_BASE_URL`.
+
+Two things to watch:
+
+- **Vertex AI takes precedence.** When `ANTHROPIC_VERTEX_PROJECT_ID` or
+  `GOOGLE_CLOUD_PROJECT` is set, Herald uses Vertex AI and ignores
+  `ANTHROPIC_BASE_URL`. Unset both to use a gateway.
+- **Reasoning tokens share `max_tokens`.** A model that emits reasoning
+  tokens spends the output budget on thinking as well as the draft, and a
+  truncated response is retried once at twice the configured value. Keep the
+  value within the gateway's output limit.
+
+Keep credentials in the environment rather than in `prefs.toml`, and use the
+gateway's plain model id without client-specific context-window suffixes.
+
+Cost estimates come from LiteLLM's public pricing database. An unknown model
+id still runs, but the session summary reports zero cost for it.
 
 ### Preferences file
 

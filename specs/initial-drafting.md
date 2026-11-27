@@ -31,10 +31,12 @@ passed by this call. There is no explicit `cache_control` in the request;
 identical system prompts alone do not establish an explicit prompt-cache policy.
 
 `create_client` selects Anthropic through Vertex AI when
-`ANTHROPIC_VERTEX_PROJECT_ID` or `GOOGLE_CLOUD_PROJECT` is set, otherwise the
-direct Anthropic client. The Vertex region is `CLOUD_ML_REGION`, defaulting to
-`us-east5`. Credentials configure the clients and data sources; Herald does not
-add credential values to the model prompt.
+`ANTHROPIC_VERTEX_PROJECT_ID` or `GOOGLE_CLOUD_PROJECT` is set; otherwise it
+creates the direct Anthropic client, which also honors `ANTHROPIC_BASE_URL` and
+`ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` so that a gateway or proxy
+implementing the Messages API can serve requests. The Vertex region is
+`CLOUD_ML_REGION`, defaulting to `us-east5`. Credentials configure the clients
+and data sources; Herald does not add credential values to the model prompt.
 
 ## Temporal evidence contract
 
